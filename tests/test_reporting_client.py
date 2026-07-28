@@ -222,7 +222,9 @@ def test_query_metric_set_hourly_carries_the_hour() -> None:
     assert timeline["endTime"] == {"year": 2026, "month": 1, "day": 1, "hours": 9}
 
 
-def test_query_metric_set_omits_timeline_when_no_dates_given() -> None:
+def test_query_metric_set_always_sends_timeline_with_a_period() -> None:
+    """The API rejects a missing timeline_spec and an unspecified aggregation
+    period -- both verified live -- so the client must always send both."""
     service = MagicMock()
     _crashrate(service).query.return_value.execute.return_value = {"rows": [{}]}
 
@@ -232,7 +234,8 @@ def test_query_metric_set_omits_timeline_when_no_dates_given() -> None:
         metrics=["crashRate"],
     )
 
-    assert "timelineSpec" not in _crashrate(service).query.call_args.kwargs["body"]
+    spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
+    assert spec["aggregationPeriod"] == "DAILY"
 
 
 def test_query_metric_set_rejects_hour_on_daily_aggregation() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import functools
 import json
 import os
@@ -5920,7 +5921,7 @@ class PlayStoreClient:
         end_date: str | None,
         aggregation_period: str | None,
     ) -> dict[str, Any]:
-        """Build a TimelineSpec from the date bounds, or {} if none were given.
+        """Build a TimelineSpec. Always non-empty: the API requires the field.
 
         Raises:
             PlayStoreClientError: If the aggregation period is unknown, or a
@@ -5928,6 +5929,21 @@ class PlayStoreClient:
                 because a daily point is identified by its date alone).
         """
         spec: dict[str, Any] = {}
+
+        # Every one of these is rejected by the API when absent -- verified live:
+        #   no timeline_spec            -> "'timeline_spec' field should be set"
+        #   no aggregation period       -> "Unsupported ... AGGREGATION_PERIOD_UNSPECIFIED"
+        #   no start date               -> "'timeline_spec.start_date' field should be set"
+        # So the timeline is always fully populated; a caller who supplies nothing
+        # gets a trailing 28-day daily window rather than a guaranteed 400.
+        aggregation_period = aggregation_period or "DAILY"
+        if start_date is None:
+            # End one day back: the API rejects an end_date beyond the current
+            # data freshness ("should be at most the current freshness"), and
+            # today is always still aggregating.
+            end = _dt.date.today() - _dt.timedelta(days=1)
+            start_date = (end - _dt.timedelta(days=27)).isoformat()
+            end_date = end_date or end.isoformat()
 
         if aggregation_period:
             if aggregation_period not in _REPORTING_AGGREGATION_PERIODS:
@@ -6199,12 +6215,21 @@ class PlayStoreClient:
         dimensions: list[str] | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
-        aggregation_period: str | None = None,
+        aggregation_period: str = "DAILY",
         filter_expression: str | None = None,
         user_cohort: str | None = None,
         max_results: int = 1000,
     ) -> dict[str, Any]:
         """Query a metric set for timeline data.
+
+        ``timelineSpec`` is always sent and ``aggregation_period`` always has a
+        value, because the API rejects both omissions -- verified live against a
+        real app:
+          no spec at all      -> "'timeline_spec' field should be set"
+          spec without period -> "Unsupported 'timeline_spec.aggregation_period':
+                                  AGGREGATION_PERIOD_UNSPECIFIED"
+        There is therefore no valid "unspecified" query; leaving either optional
+        only produced a guaranteed 400.
 
         One call can return several metrics sliced by several dimensions, which
         is the quota-friendly shape — see the quota note at the top of this
