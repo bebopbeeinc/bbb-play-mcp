@@ -140,29 +140,6 @@ class TestSubscriptionProduct:
         assert len(product.base_plans) == 1
 
 
-class TestInAppProduct:
-    """Test InAppProduct model."""
-
-    def test_in_app_product(self) -> None:
-        """Test in-app product model."""
-        from play_store_mcp.models import InAppProduct
-
-        product = InAppProduct(
-            sku="premium_upgrade",
-            package_name="com.example.app",
-            product_type="managedProduct",
-            status="active",
-            default_language="en-US",
-            title="Premium Upgrade",
-            description="Unlock all features",
-            default_price={"currency": "USD", "priceMicros": "4990000"},
-        )
-
-        assert product.sku == "premium_upgrade"
-        assert product.product_type == "managedProduct"
-        assert product.default_price is not None
-
-
 class TestListing:
     """Test Listing model."""
 

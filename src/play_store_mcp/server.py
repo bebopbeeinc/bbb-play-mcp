@@ -13,6 +13,7 @@ import os
 import secrets
 import sys
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from play_store_mcp.client import PlayStoreClient, PlayStoreClientError
+from play_store_mcp.client import (
+    REPORTING_METRIC_SETS,
+    PlayStoreClient,
+    PlayStoreClientError,
+)
 
 # Configure structured logging to stderr (stdout is reserved for MCP JSON-RPC)
 log_level = os.environ.get("PLAY_STORE_MCP_LOG_LEVEL", "INFO")
@@ -170,7 +175,7 @@ def _build_transforms() -> list[Any]:
     When CODE_MODE is enabled, wrap the tool surface in the experimental CodeMode
     transform (search/get_schema/execute meta-tools + sandboxed execution), which
     cuts per-request tool-list overhead. Default: no transforms — the classic
-    117-tool surface, unchanged.
+    126-tool surface, unchanged.
     """
     if not _code_mode_enabled():
         return []
@@ -825,200 +830,6 @@ def get_product_purchase_v2(
 
 
 # =============================================================================
-# In-App Products Tools
-# =============================================================================
-
-
-@mcp.tool()
-def list_in_app_products(package_name: str) -> list[dict[str, Any]]:
-    """List all in-app products for an app.
-
-    Args:
-        package_name: App package name
-
-    Returns:
-        List of in-app products with SKU, title, description, and pricing
-    """
-    client = get_client_from_context()
-
-    products = client.list_in_app_products(package_name)
-    return [product.model_dump() for product in products]
-
-
-@mcp.tool()
-def get_in_app_product(
-    package_name: str,
-    sku: str,
-) -> dict[str, Any]:
-    """Get details of a specific in-app product.
-
-    Args:
-        package_name: App package name
-        sku: Product SKU identifier
-
-    Returns:
-        In-app product details including title, description, and pricing
-    """
-    client = get_client_from_context()
-
-    product = client.get_in_app_product(package_name, sku)
-    return product.model_dump()
-
-
-@mcp.tool()
-def create_in_app_product(
-    package_name: str,
-    product: dict[str, Any],
-) -> dict[str, Any]:
-    """Create a new in-app product in the catalog.
-
-    Disabled in read-only mode.
-
-    Args:
-        package_name: App package name
-        product: In-app product resource body (e.g. sku, purchaseType, defaultPrice,
-            listings, status, defaultLanguage)
-
-    Returns:
-        The created in-app product
-    """
-    if blocked := _read_only_block("create_in_app_product"):
-        return blocked
-    client = get_client_from_context()
-
-    result = client.create_in_app_product(package_name=package_name, product=product)
-    return result.model_dump()
-
-
-@mcp.tool()
-def update_in_app_product(
-    package_name: str,
-    sku: str,
-    product: dict[str, Any],
-    auto_convert_missing_prices: bool = False,
-) -> dict[str, Any]:
-    """Update (replace) an existing in-app product.
-
-    Disabled in read-only mode.
-
-    Args:
-        package_name: App package name
-        sku: Product SKU identifier
-        product: In-app product resource body
-        auto_convert_missing_prices: Auto-convert prices for regions without a
-            specified price based on the default price (default: False)
-
-    Returns:
-        The updated in-app product
-    """
-    if blocked := _read_only_block("update_in_app_product"):
-        return blocked
-    client = get_client_from_context()
-
-    result = client.update_in_app_product(
-        package_name=package_name,
-        sku=sku,
-        product=product,
-        auto_convert_missing_prices=auto_convert_missing_prices,
-    )
-    return result.model_dump()
-
-
-@mcp.tool()
-def patch_in_app_product(
-    package_name: str,
-    sku: str,
-    product: dict[str, Any],
-) -> dict[str, Any]:
-    """Partially update an existing in-app product.
-
-    Disabled in read-only mode.
-
-    Args:
-        package_name: App package name
-        sku: Product SKU identifier
-        product: Partial in-app product resource body with fields to change
-
-    Returns:
-        The patched in-app product
-    """
-    if blocked := _read_only_block("patch_in_app_product"):
-        return blocked
-    client = get_client_from_context()
-
-    result = client.patch_in_app_product(package_name=package_name, sku=sku, product=product)
-    return result.model_dump()
-
-
-@mcp.tool()
-def delete_in_app_product(
-    package_name: str,
-    sku: str,
-) -> dict[str, Any]:
-    """Delete an in-app product from the catalog.
-
-    Disabled in read-only mode.
-
-    Args:
-        package_name: App package name
-        sku: Product SKU identifier
-
-    Returns:
-        Result with success status
-    """
-    if blocked := _read_only_block("delete_in_app_product"):
-        return blocked
-    client = get_client_from_context()
-
-    result = client.delete_in_app_product(package_name=package_name, sku=sku)
-    return result.model_dump()
-
-
-@mcp.tool()
-def batch_get_in_app_products(
-    package_name: str,
-    skus: list[str],
-) -> list[dict[str, Any]]:
-    """Get details for multiple in-app products at once.
-
-    Args:
-        package_name: App package name
-        skus: List of product SKUs to retrieve
-
-    Returns:
-        List of in-app products, in the same order as requested
-    """
-    client = get_client_from_context()
-
-    products = client.batch_get_in_app_products(package_name=package_name, skus=skus)
-    return [product.model_dump() for product in products]
-
-
-@mcp.tool()
-def batch_delete_in_app_products(
-    package_name: str,
-    skus: list[str],
-) -> dict[str, Any]:
-    """Delete multiple in-app products in a single operation.
-
-    Disabled in read-only mode.
-
-    Args:
-        package_name: App package name
-        skus: List of product SKUs to delete
-
-    Returns:
-        Result with success status
-    """
-    if blocked := _read_only_block("batch_delete_in_app_products"):
-        return blocked
-    client = get_client_from_context()
-
-    result = client.batch_delete_in_app_products(package_name=package_name, skus=skus)
-    return result.model_dump()
-
-
-# =============================================================================
 # One-Time Product Catalog Tools
 # =============================================================================
 
@@ -1090,17 +901,31 @@ def patch_one_time_product(
     product: dict[str, Any],
     update_mask: str,
     regions_version: str = "2022/02",
+    allow_missing: bool = False,
+    latency_tolerance: str | None = None,
 ) -> dict[str, Any]:
-    """Create or update a one-time product (patch is create-or-update).
+    """Update a one-time product, optionally creating it if it does not exist.
+
+    One-time products have no insert method: creating a product is a patch with
+    allow_missing=True. This is the replacement for the retired
+    create_in_app_product / update_in_app_product tools.
 
     Disabled in read-only mode.
 
     Args:
         package_name: App package name
-        product_id: One-time product ID
+        product_id: One-time product ID (the replacement for the old SKU)
         product: Partial OneTimeProduct resource body with fields to change
-        update_mask: Comma-separated list of fields to update
+            (productId, listings, purchaseOptions, offerTags, taxAndComplianceSettings,
+            restrictedPaymentCountries). Pricing lives in purchaseOptions, not in a
+            flat defaultPrice/prices as it did on the old in-app product resource.
+        update_mask: Comma-separated list of fields to update, e.g. "listings,offerTags".
+            Required, and ignored by the API when allow_missing creates a new product.
         regions_version: Version of available regions for regional prices (default: "2022/02")
+        allow_missing: Create the product when it does not exist (upsert). Use this
+            instead of the removed create_in_app_product tool (default: False)
+        latency_tolerance: Optional propagation latency tolerance, e.g.
+            "PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_SENSITIVE"
 
     Returns:
         The patched one-time product
@@ -1115,6 +940,8 @@ def patch_one_time_product(
         product=product,
         update_mask=update_mask,
         regions_version=regions_version,
+        allow_missing=allow_missing,
+        latency_tolerance=latency_tolerance,
     )
     return result.model_dump()
 
@@ -3539,6 +3366,575 @@ def upload_internal_app_sharing_bundle(
         bundle_path=bundle_path,
     )
     return artifact.model_dump()
+
+
+# =============================================================================
+# Android Vitals Tools (Play Developer Reporting API)
+# =============================================================================
+
+# Every tool in this section reads the Play Developer Reporting API (v1beta1),
+# which is read-only by construction — its whole surface is get/query/search/
+# list, with no write methods anywhere — so none of them are gated by
+# --read-only. Its default quota is around 10 queries per second, which is what
+# the tools below are shaped around: slice a single query with `dimensions`
+# rather than fanning out one query per dimension value, and ask for no more
+# results than are worth reading, since the client pages up to max_results.
+
+# Default reporting window, matching the Play Console's 28-day vitals view and
+# the 28-day user-weighted metrics Google evaluates its thresholds against.
+DEFAULT_VITALS_DAYS = 28
+
+# Upper bound on a requested window. The Reporting API retains roughly a year of
+# daily aggregates; a larger request is a caller mistake, not a query.
+MAX_VITALS_DAYS = 365
+
+# Vitals are read as a daily timeline — one row per day, which is the shape a
+# regression is visible in. The API requires the period to be stated explicitly.
+VITALS_AGGREGATION_PERIOD = "DAILY"
+
+# Metrics requested per metric set: one list is one query. The "userPerceived"
+# variants are what Google measures against its bad-behavior thresholds, and
+# distinctUsers is the denominator those rates are computed over.
+CRASH_RATE_METRICS = ["crashRate", "userPerceivedCrashRate", "distinctUsers"]
+ANR_RATE_METRICS = ["anrRate", "userPerceivedAnrRate", "distinctUsers"]
+EXCESSIVE_WAKEUP_RATE_METRICS = ["excessiveWakeupRate", "distinctUsers"]
+SLOW_START_RATE_METRICS = ["slowStartRate", "distinctUsers"]
+
+
+def _validate_vitals_days(days: int) -> str | None:
+    """Return error message if the reporting window is invalid, None if valid."""
+    if not (1 <= days <= MAX_VITALS_DAYS):
+        return f"days must be between 1 and {MAX_VITALS_DAYS}"
+    return None
+
+
+def _validate_metric_set(metric_set: str) -> str | None:
+    """Return error message if metric_set is not a known metric set, None if valid."""
+    if metric_set not in REPORTING_METRIC_SETS:
+        return f"metric_set must be one of: {', '.join(REPORTING_METRIC_SETS)}"
+    return None
+
+
+def _vitals_window(days: int) -> tuple[str, str]:
+    """Return (start_date, end_date) as YYYY-MM-DD for a trailing window of days.
+
+    The end bound is exclusive, so the window is the `days` complete days before
+    today rather than a partial day of data that is still aggregating.
+    """
+    end = datetime.now(UTC).date()
+    start = end - timedelta(days=days)
+    return start.isoformat(), end.isoformat()
+
+
+def _query_vitals(
+    package_name: str,
+    metric_set: str,
+    metrics: list[str],
+    days: int,
+    dimensions: list[str] | None,
+) -> dict[str, Any]:
+    """Run one metric-set query and wrap it with the window it covers.
+
+    Dimensions are resolved inside that single query rather than by issuing a
+    query per dimension value, which matters because the API's default quota is
+    around 10 QPS.
+    """
+    start_date, end_date = _vitals_window(days)
+
+    client = get_client_from_context()
+
+    data = client.query_metric_set(
+        package_name=package_name,
+        metric_set=metric_set,
+        metrics=metrics,
+        dimensions=dimensions,
+        start_date=start_date,
+        end_date=end_date,
+        aggregation_period=VITALS_AGGREGATION_PERIOD,
+    )
+
+    return {
+        "package_name": package_name,
+        "metric_set": metric_set,
+        "metrics": metrics,
+        "dimensions": dimensions or [],
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "data": data,
+    }
+
+
+@mcp.tool()
+def get_crash_rate(
+    package_name: str,
+    days: int = DEFAULT_VITALS_DAYS,
+    dimensions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get the daily crash-rate timeline for an app (Android vitals).
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    there is no way to modify vitals data.
+
+    Returns one row per day with crashRate (any crash), userPerceivedCrashRate
+    (a crash while the user was actively using the app — the metric Google's
+    1.09% bad-behavior threshold applies to), and distinctUsers, the denominator
+    those rates are computed over. Rates are fractions: 0.0109 means 1.09%.
+
+    Costs a single Reporting API query. Vitals lag real time, so an empty tail
+    (or an empty result with a `note`) usually means the window ran past the
+    latest available data — get_metric_freshness("crashRateMetricSet") reports
+    how current the metric set is.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+        dimensions: Optional breakdown resolved inside the same single query
+            (e.g. ["versionCode"], ["deviceModel"], ["apiLevel"], ["countryCode"]).
+            Omit for an app-wide timeline.
+
+    Returns:
+        The window queried plus the crash-rate timeline returned by the API
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    return _query_vitals(
+        package_name=package_name,
+        metric_set="crashRateMetricSet",
+        metrics=CRASH_RATE_METRICS,
+        days=days,
+        dimensions=dimensions,
+    )
+
+
+@mcp.tool()
+def get_anr_rate(
+    package_name: str,
+    days: int = DEFAULT_VITALS_DAYS,
+    dimensions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get the daily ANR (Application Not Responding) rate timeline for an app.
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    there is no way to modify vitals data.
+
+    Returns one row per day with anrRate (any ANR), userPerceivedAnrRate (an ANR
+    the user was present for — the metric Google's 0.47% bad-behavior threshold
+    applies to), and distinctUsers, the denominator. Rates are fractions:
+    0.0047 means 0.47%.
+
+    Costs a single Reporting API query. Vitals lag real time, so an empty tail
+    (or an empty result with a `note`) usually means the window ran past the
+    latest available data — get_metric_freshness("anrRateMetricSet") reports how
+    current the metric set is.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+        dimensions: Optional breakdown resolved inside the same single query
+            (e.g. ["versionCode"], ["deviceModel"], ["apiLevel"], ["countryCode"]).
+            Omit for an app-wide timeline.
+
+    Returns:
+        The window queried plus the ANR-rate timeline returned by the API
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    return _query_vitals(
+        package_name=package_name,
+        metric_set="anrRateMetricSet",
+        metrics=ANR_RATE_METRICS,
+        days=days,
+        dimensions=dimensions,
+    )
+
+
+@mcp.tool()
+def get_excessive_wakeup_rate(
+    package_name: str,
+    days: int = DEFAULT_VITALS_DAYS,
+    dimensions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get the daily excessive-wakeup rate timeline for an app (battery vitals).
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    there is no way to modify vitals data.
+
+    excessiveWakeupRate is the fraction of distinct users whose device the app
+    woke more than 10 times per hour — the Android vitals signal for alarm and
+    JobScheduler abuse draining battery. distinctUsers is the denominator.
+
+    Costs a single Reporting API query.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+        dimensions: Optional breakdown resolved inside the same single query
+            (e.g. ["versionCode"], ["deviceModel"]). Omit for an app-wide timeline.
+
+    Returns:
+        The window queried plus the excessive-wakeup-rate timeline from the API
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    return _query_vitals(
+        package_name=package_name,
+        metric_set="excessiveWakeupRateMetricSet",
+        metrics=EXCESSIVE_WAKEUP_RATE_METRICS,
+        days=days,
+        dimensions=dimensions,
+    )
+
+
+@mcp.tool()
+def get_slow_start_rate(
+    package_name: str,
+    days: int = DEFAULT_VITALS_DAYS,
+    dimensions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get the daily slow-app-start rate timeline for an app.
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    there is no way to modify vitals data.
+
+    slowStartRate is the fraction of distinct users who saw a start slower than
+    the Android vitals threshold for its start type: 5s cold, 2s warm, 1.5s hot.
+    Pass dimensions=["startType"] to split COLD/WARM/HOT within the same single
+    query — cold start is usually the one worth acting on.
+
+    Costs a single Reporting API query.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+        dimensions: Optional breakdown resolved inside the same single query
+            (e.g. ["startType"], ["versionCode"], ["deviceModel"]). Omit for a
+            single app-wide timeline across all start types.
+
+    Returns:
+        The window queried plus the slow-start-rate timeline returned by the API
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    return _query_vitals(
+        package_name=package_name,
+        metric_set="slowStartRateMetricSet",
+        metrics=SLOW_START_RATE_METRICS,
+        days=days,
+        dimensions=dimensions,
+    )
+
+
+@mcp.tool()
+def get_vitals_summary(
+    package_name: str,
+    days: int = DEFAULT_VITALS_DAYS,
+) -> dict[str, Any]:
+    """Get an app's headline Android vitals — crash, ANR, and slow start — at once.
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    there is no way to modify vitals data.
+
+    This is the tool for "how healthy is this app?", "did the last release
+    regress stability?", or "are we near the Play Console bad-behavior
+    thresholds?". It returns three daily timelines over one shared window, so
+    they can be read against each other without further calls.
+
+    What to look at:
+      - crash_rate: userPerceivedCrashRate — bad-behavior threshold 1.09%.
+        Above it, Play can reduce the app's store visibility.
+      - anr_rate: userPerceivedAnrRate — bad-behavior threshold 0.47%.
+      - slow_start_rate: slowStartRate — starts over 5s cold, 2s warm, 1.5s hot.
+    All rates are fractions (0.0109 = 1.09%) over distinctUsers, which each
+    timeline also reports.
+
+    Cost: exactly three Reporting API queries, one per metric set, with no
+    dimension breakdown. The API's default quota is around 10 QPS, so this
+    deliberately does not fan out per version, device, or country — call
+    get_crash_rate, get_anr_rate, or get_slow_start_rate with an explicit
+    `dimensions` list when a breakdown is actually needed. Excessive wakeups
+    have their own tool (get_excessive_wakeup_rate) and are not queried here.
+
+    A timeline that comes back empty carries a `note` explaining the likely
+    cause — too little traffic, a window past the data's freshness, or a service
+    account without the Play Console app-quality permission.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+
+    Returns:
+        The shared window plus crash_rate, anr_rate, and slow_start_rate timelines
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    start_date, end_date = _vitals_window(days)
+
+    client = get_client_from_context()
+
+    crash_rate = client.query_metric_set(
+        package_name=package_name,
+        metric_set="crashRateMetricSet",
+        metrics=CRASH_RATE_METRICS,
+        start_date=start_date,
+        end_date=end_date,
+        aggregation_period=VITALS_AGGREGATION_PERIOD,
+    )
+    anr_rate = client.query_metric_set(
+        package_name=package_name,
+        metric_set="anrRateMetricSet",
+        metrics=ANR_RATE_METRICS,
+        start_date=start_date,
+        end_date=end_date,
+        aggregation_period=VITALS_AGGREGATION_PERIOD,
+    )
+    slow_start_rate = client.query_metric_set(
+        package_name=package_name,
+        metric_set="slowStartRateMetricSet",
+        metrics=SLOW_START_RATE_METRICS,
+        start_date=start_date,
+        end_date=end_date,
+        aggregation_period=VITALS_AGGREGATION_PERIOD,
+    )
+
+    return {
+        "package_name": package_name,
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "metric_sets": ["crashRateMetricSet", "anrRateMetricSet", "slowStartRateMetricSet"],
+        "crash_rate": crash_rate,
+        "anr_rate": anr_rate,
+        "slow_start_rate": slow_start_rate,
+    }
+
+
+@mcp.tool()
+def search_error_issues(
+    package_name: str,
+    days: int = DEFAULT_VITALS_DAYS,
+    filter_expression: str | None = None,
+    order_by: str = "errorReportCount desc",
+    max_results: int = 25,
+) -> dict[str, Any]:
+    """Search an app's crash and ANR issues — the "top crashes" view.
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    issues cannot be closed, annotated, or assigned from here.
+
+    An issue is a cluster of error reports sharing a root cause, which is the
+    level to triage at: this answers "what should we fix first?". Each issue
+    carries its report and user counts; pass its errorIssueId to
+    search_error_reports for the individual stack traces behind it.
+
+    Costs one Reporting API query per page of results, so keep max_results at
+    the size actually worth reading — the quota is only around 10 QPS. A
+    nextPageToken in the response means more issues exist beyond it.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+        filter_expression: Optional AIP-160 filter over fields such as
+            apiLevel, versionCode, deviceModel, or errorIssueType
+            (e.g. 'errorIssueType = CRASH AND versionCode = 123')
+        order_by: Sort order — "errorReportCount" or "distinctUsers", each with
+            " asc" or " desc" (default: "errorReportCount desc", the ranking
+            that puts the worst issue first)
+        max_results: Maximum issues to return (default: 25)
+
+    Returns:
+        The window queried plus the matching error issues and any nextPageToken
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    start_date, end_date = _vitals_window(days)
+
+    client = get_client_from_context()
+
+    issues = client.search_error_issues(
+        package_name=package_name,
+        start_date=start_date,
+        end_date=end_date,
+        filter_expression=filter_expression,
+        order_by=order_by,
+        max_results=max_results,
+    )
+
+    return {
+        "package_name": package_name,
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "issues": issues,
+    }
+
+
+@mcp.tool()
+def search_error_reports(
+    package_name: str,
+    issue_id: str | None = None,
+    days: int = DEFAULT_VITALS_DAYS,
+    filter_expression: str | None = None,
+    max_results: int = 25,
+) -> dict[str, Any]:
+    """Search an app's individual crash and ANR reports (stack traces).
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    reports cannot be modified or deleted from here.
+
+    Each report is one captured error with its stack trace, app version, device
+    model, and OS level — the detail behind an issue from search_error_issues.
+    Pass that issue's ID as issue_id to pull only its reports; omit it to sample
+    recent reports across the whole app.
+
+    Costs one Reporting API query per page of results, so keep max_results at
+    the size actually worth reading — the quota is only around 10 QPS. A
+    nextPageToken in the response means more reports exist beyond it.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        issue_id: Optional issue from search_error_issues, as either the bare ID
+            or the full apps/{package}/errorIssues/{id} name, to scope the
+            reports to that issue. Combined with filter_expression when both are
+            given.
+        days: Length of the trailing window in days, ending today exclusive
+            (default: 28)
+        filter_expression: Optional AIP-160 filter over fields such as
+            versionCode, deviceModel, errorIssueType, or isUserPerceived
+            (e.g. 'errorIssueType = ANR')
+        max_results: Maximum reports to return (default: 25)
+
+    Returns:
+        The window queried plus the matching error reports and any nextPageToken
+    """
+    if err := _validate_vitals_days(days):
+        return {"error": err}
+
+    start_date, end_date = _vitals_window(days)
+
+    client = get_client_from_context()
+
+    reports = client.search_error_reports(
+        package_name=package_name,
+        issue_id=issue_id,
+        start_date=start_date,
+        end_date=end_date,
+        filter_expression=filter_expression,
+        max_results=max_results,
+    )
+
+    return {
+        "package_name": package_name,
+        "issue_id": issue_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": days,
+        "reports": reports,
+    }
+
+
+@mcp.tool()
+def list_anomalies(
+    package_name: str,
+    days: int | None = None,
+    max_results: int = 25,
+) -> dict[str, Any]:
+    """List Android vitals anomalies Google detected for an app.
+
+    Read-only: the Play Developer Reporting API defines no write methods, so
+    anomalies cannot be acknowledged or dismissed from here.
+
+    An anomaly is a metric Play itself flagged as moving well outside the app's
+    expected range — the signal behind Play Console vitals alerts. That makes
+    this the cheapest way to ask "did anything get worse?" before spending
+    queries on full timelines with get_vitals_summary. An empty list is good
+    news, and says so in a `note`.
+
+    Costs a single Reporting API query.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        days: Optional trailing window in days — only anomalies still active
+            within it are returned. Omit for every anomaly Play currently holds.
+        max_results: Maximum anomalies to return (default: 25)
+
+    Returns:
+        The detected anomalies, each naming the metric set and window involved
+    """
+    active_filter: str | None = None
+    if days is not None:
+        if err := _validate_vitals_days(days):
+            return {"error": err}
+        start_date, _ = _vitals_window(days)
+        active_filter = f'activeBetween("{start_date}T00:00:00Z", UNBOUNDED)'
+
+    client = get_client_from_context()
+
+    anomalies = client.list_anomalies(
+        package_name=package_name,
+        filter_expression=active_filter,
+        max_results=max_results,
+    )
+
+    return {
+        "package_name": package_name,
+        "days": days,
+        "filter": active_filter,
+        "anomalies": anomalies,
+    }
+
+
+@mcp.tool()
+def get_metric_freshness(package_name: str, metric_set: str) -> dict[str, Any]:
+    """Get how current a vitals metric set is — the latest data available.
+
+    Read-only: the Play Developer Reporting API defines no write methods.
+
+    Vitals lag real time by hours to days, so a window that runs up to today
+    normally has empty or partial rows at its tail. Call this when a recent
+    regression appears to have "disappeared", when a query comes back empty, or
+    before comparing two windows, to confirm the data exists yet.
+
+    Costs a single Reporting API query.
+
+    Args:
+        package_name: App package name (e.g., com.example.myapp)
+        metric_set: Metric set to inspect — one of crashRateMetricSet,
+            anrRateMetricSet, excessiveWakeupRateMetricSet,
+            stuckBackgroundWakelockRateMetricSet, slowStartRateMetricSet,
+            slowRenderingRateMetricSet, lmkRateMetricSet, errorCountMetricSet
+
+    Returns:
+        The metric set resource with its freshnessInfo — the latest available
+        end time per aggregation period (HOURLY, DAILY, FULL_RANGE)
+    """
+    if err := _validate_metric_set(metric_set):
+        return {"error": err}
+
+    client = get_client_from_context()
+
+    freshness = client.get_metric_set_freshness(
+        package_name=package_name,
+        metric_set=metric_set,
+    )
+
+    return {
+        "package_name": package_name,
+        "metric_set": metric_set,
+        "freshness": freshness,
+    }
 
 
 # =============================================================================

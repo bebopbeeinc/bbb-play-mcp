@@ -160,6 +160,51 @@ def test_list_one_time_products_success():
     _otp(service).list.assert_called_once_with(packageName="com.example.app")
 
 
+def test_list_one_time_products_paginates_with_page_token():
+    """Paging is pageToken/nextPageToken, not the retired maxResults/startIndex/token."""
+    service = MagicMock()
+    _otp(service).list.return_value.execute.side_effect = [
+        {"oneTimeProducts": [_OTP_RESPONSE], "nextPageToken": "tok"},
+        {"oneTimeProducts": [{"productId": "gems_pack"}]},
+    ]
+    client = _client(service)
+
+    result = client.list_one_time_products("com.example.app")
+
+    assert [p.product_id for p in result] == ["coins_pack", "gems_pack"]
+    assert _otp(service).list.call_count == 2
+    first, second = _otp(service).list.call_args_list
+    assert first.kwargs == {"packageName": "com.example.app"}
+    assert second.kwargs == {"packageName": "com.example.app", "pageToken": "tok"}
+    for call in (first, second):
+        assert "token" not in call.kwargs
+        assert "maxResults" not in call.kwargs
+        assert "startIndex" not in call.kwargs
+
+
+def test_list_one_time_products_ignores_retired_inappproduct_key():
+    """The items key is oneTimeProducts; the old 'inappproduct' key must not be read."""
+    service = MagicMock()
+    _otp(service).list.return_value.execute.return_value = {"inappproduct": [{"sku": "old"}]}
+    client = _client(service)
+
+    assert client.list_one_time_products("com.example.app") == []
+    service.inappproducts.assert_not_called()
+
+
+def test_get_one_time_product_uses_product_id_not_sku():
+    service = MagicMock()
+    _otp(service).get.return_value.execute.return_value = _OTP_RESPONSE
+    client = _client(service)
+
+    client.get_one_time_product("com.example.app", "coins_pack")
+
+    service.monetization.return_value.onetimeproducts.assert_called()
+    service.inappproducts.assert_not_called()
+    assert _otp(service).get.call_args.kwargs["productId"] == "coins_pack"
+    assert "sku" not in _otp(service).get.call_args.kwargs
+
+
 def test_list_one_time_products_empty():
     service = MagicMock()
     _otp(service).list.return_value.execute.return_value = {}
@@ -243,7 +288,84 @@ def test_patch_one_time_product_success():
         productId="coins_pack",
         updateMask="listings",
         regionsVersion_version="2022/02",
+        allowMissing=False,
         body=body,
+    )
+
+
+def test_patch_one_time_product_uses_monetization_resource_not_inappproducts():
+    """The catalog must go through monetization().onetimeproducts(), never inappproducts()."""
+    service = MagicMock()
+    _otp(service).patch.return_value.execute.return_value = _OTP_RESPONSE
+    client = _client(service)
+
+    client.patch_one_time_product(
+        "com.example.app", "coins_pack", {"offerTags": []}, update_mask="offerTags"
+    )
+
+    service.monetization.assert_called()
+    service.monetization.return_value.onetimeproducts.assert_called()
+    service.inappproducts.assert_not_called()
+    # The identifier is productId -- the retired resource's "sku" must not appear.
+    kwargs = _otp(service).patch.call_args.kwargs
+    assert kwargs["productId"] == "coins_pack"
+    assert "sku" not in kwargs
+
+
+def test_patch_one_time_product_allow_missing_upserts():
+    """allow_missing=True is the replacement for the removed inappproducts.insert."""
+    service = MagicMock()
+    _otp(service).patch.return_value.execute.return_value = _OTP_RESPONSE
+    client = _client(service)
+
+    body = {"productId": "coins_pack", "listings": [{"languageCode": "en-US", "title": "Coins"}]}
+    result = client.patch_one_time_product(
+        "com.example.app",
+        "coins_pack",
+        body,
+        update_mask="listings",
+        allow_missing=True,
+    )
+
+    assert result.product_id == "coins_pack"
+    _otp(service).patch.assert_called_once_with(
+        packageName="com.example.app",
+        productId="coins_pack",
+        updateMask="listings",
+        regionsVersion_version="2022/02",
+        allowMissing=True,
+        body=body,
+    )
+
+
+def test_patch_one_time_product_latency_tolerance_omitted_when_unset():
+    service = MagicMock()
+    _otp(service).patch.return_value.execute.return_value = _OTP_RESPONSE
+    client = _client(service)
+
+    client.patch_one_time_product(
+        "com.example.app", "coins_pack", {"offerTags": []}, update_mask="offerTags"
+    )
+
+    assert "latencyTolerance" not in _otp(service).patch.call_args.kwargs
+
+
+def test_patch_one_time_product_latency_tolerance_forwarded():
+    service = MagicMock()
+    _otp(service).patch.return_value.execute.return_value = _OTP_RESPONSE
+    client = _client(service)
+
+    client.patch_one_time_product(
+        "com.example.app",
+        "coins_pack",
+        {"offerTags": []},
+        update_mask="offerTags",
+        latency_tolerance="PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_TOLERANT",
+    )
+
+    assert (
+        _otp(service).patch.call_args.kwargs["latencyTolerance"]
+        == "PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_TOLERANT"
     )
 
 
@@ -266,6 +388,7 @@ def test_patch_one_time_product_custom_regions_version():
         productId="coins_pack",
         updateMask="offerTags",
         regionsVersion_version="2023/06",
+        allowMissing=False,
         body=body,
     )
 
@@ -453,6 +576,38 @@ def test_tool_patch_one_time_product(monkeypatch):
         product=body,
         update_mask="listings",
         regions_version="2022/02",
+        allow_missing=False,
+        latency_tolerance=None,
+    )
+
+
+def test_tool_patch_one_time_product_allow_missing(monkeypatch):
+    """The tool forwards the upsert flag that replaces create_in_app_product."""
+    monkeypatch.setattr(server, "READ_ONLY", False)
+    mc = MagicMock()
+    mc.patch_one_time_product.return_value = OneTimeProduct(
+        product_id="coins_pack", package_name="com.example.app"
+    )
+    monkeypatch.setattr(server, "get_client_from_context", lambda: mc)
+
+    body = {"productId": "coins_pack"}
+    server.patch_one_time_product(
+        "com.example.app",
+        "coins_pack",
+        body,
+        update_mask="listings",
+        allow_missing=True,
+        latency_tolerance="PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_TOLERANT",
+    )
+
+    mc.patch_one_time_product.assert_called_once_with(
+        package_name="com.example.app",
+        product_id="coins_pack",
+        product=body,
+        update_mask="listings",
+        regions_version="2022/02",
+        allow_missing=True,
+        latency_tolerance="PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_TOLERANT",
     )
 
 

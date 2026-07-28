@@ -40,8 +40,6 @@ from play_store_mcp.models import (
     GeneratedApksDownload,
     Grant,
     ImageDeleteResult,
-    InAppProduct,
-    InAppProductActionResult,
     InternalAppSharingArtifact,
     Listing,
     ListingUpdateResult,
@@ -71,12 +69,29 @@ from play_store_mcp.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from googleapiclient._apis.androidpublisher.v3 import AndroidPublisherResource
+    from googleapiclient._apis.playdeveloperreporting.v1beta1 import (
+        PlaydeveloperreportingResource,
+    )
 
 logger = structlog.get_logger(__name__)
 
 # API scopes required for Play Developer API
-SCOPES = ["https://www.googleapis.com/auth/androidpublisher"]
+#
+# The playdeveloperreporting scope looks like a privilege escalation but is not:
+# an OAuth scope only selects which APIs a token is allowed to address, it grants
+# no access to any app. All authorization still comes from the Play Console
+# permissions attached to the service account — Android vitals needs
+# CAN_VIEW_APP_QUALITY ("View app quality data such as Vitals, Crashes etc.") on
+# the app, and without it these calls fail with 403 even though the scope is
+# present. The Reporting API is also read-only (see the Vitals section below),
+# so the added scope cannot write anything anywhere.
+SCOPES = [
+    "https://www.googleapis.com/auth/androidpublisher",
+    "https://www.googleapis.com/auth/playdeveloperreporting",
+]
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -94,6 +109,57 @@ _REVOCATION_CONTEXTS: dict[str, dict[str, dict]] = {
     "full": {"fullRefund": {}},
     "prorated": {"proratedRefund": {}},
 }
+
+# Google Play Developer Reporting API (Android vitals). A different host and
+# version from androidpublisher, so it needs its own discovery build.
+REPORTING_API_NAME = "playdeveloperreporting"
+REPORTING_API_VERSION = "v1beta1"
+
+# Play Console permission that gates every Reporting API read. Named in error
+# messages: a service account without it gets a 403 (or, for some resources, a
+# successful-but-empty payload), which is by far the most common cause of
+# "why are vitals empty?".
+REPORTING_PERMISSION = 'CAN_VIEW_APP_QUALITY ("View app quality data such as Vitals, Crashes etc.")'
+
+# Metric sets exposed by the Reporting API, mapped to their discovery resource
+# path. The key is also the resource ID in the metric set's own resource name
+# (apps/{package}/{metric_set}), so one name serves both purposes.
+_REPORTING_METRIC_SET_RESOURCES: dict[str, tuple[str, ...]] = {
+    "crashRateMetricSet": ("vitals", "crashrate"),
+    "anrRateMetricSet": ("vitals", "anrrate"),
+    "excessiveWakeupRateMetricSet": ("vitals", "excessivewakeuprate"),
+    "stuckBackgroundWakelockRateMetricSet": ("vitals", "stuckbackgroundwakelockrate"),
+    "slowStartRateMetricSet": ("vitals", "slowstartrate"),
+    "slowRenderingRateMetricSet": ("vitals", "slowrenderingrate"),
+    "lmkRateMetricSet": ("vitals", "lmkrate"),
+    "errorCountMetricSet": ("vitals", "errors", "counts"),
+}
+
+# Metric set names accepted by get_metric_set_freshness / query_metric_set.
+REPORTING_METRIC_SETS: tuple[str, ...] = tuple(_REPORTING_METRIC_SET_RESOURCES)
+
+# The error count metric set counts reports rather than measuring a rate over a
+# user population, so its query request has no userCohort field and the API
+# rejects one.
+_REPORTING_METRIC_SETS_WITHOUT_USER_COHORT = frozenset({"errorCountMetricSet"})
+
+# Timeline aggregation periods (AggregationPeriod enum, minus UNSPECIFIED).
+_REPORTING_AGGREGATION_PERIODS = frozenset({"HOURLY", "DAILY", "FULL_RANGE"})
+
+# Largest page each Reporting method accepts. Asking for more is not an error —
+# the API coerces the value down — but requesting the documented cap keeps the
+# number of round trips, and so the quota spend, as low as possible.
+_REPORTING_MAX_PAGE_SIZE_METRICS = 100000
+_REPORTING_MAX_PAGE_SIZE_ISSUES = 1000
+_REPORTING_MAX_PAGE_SIZE_REPORTS = 100
+_REPORTING_MAX_PAGE_SIZE_ANOMALIES = 100
+
+# Accepted date formats for Reporting API time bounds: a plain date, or a date
+# with an hour for HOURLY aggregation and the hour-aligned error searches.
+_REPORTING_DATE_FORMATS: tuple[tuple[str, bool], ...] = (
+    ("%Y-%m-%dT%H", True),
+    ("%Y-%m-%d", False),
+)
 
 
 class PlayStoreClientError(Exception):
@@ -256,6 +322,7 @@ class PlayStoreClient:
             else os.environ.get("PLAY_STORE_MCP_DOWNLOAD_DIR")
         )
         self._service: AndroidPublisherResource | None = None
+        self._reporting_service: PlaydeveloperreportingResource | None = None
         # Serializes API I/O on this client's single (non-thread-safe) httplib2
         # transport. The shared fallback client is used across concurrent tool
         # worker threads; per-request header clients each get their own lock.
@@ -379,6 +446,61 @@ class PlayStoreClient:
 
         return errors
 
+    def _load_credentials(self) -> Any:
+        """Resolve service account credentials from the configured sources.
+
+        Shared by every service build so the credential sources (inline JSON,
+        JSON-or-path string, or ``credentials_path``) stay in one place.
+
+        Returns:
+            Scoped service account credentials.
+
+        Raises:
+            PlayStoreClientError: If no usable credentials were found.
+        """
+        credentials = None
+
+        # Try credentials_json first (from string or dict)
+        if self._credentials_json:
+            if isinstance(self._credentials_json, str):
+                try:
+                    # Check if it's actually JSON or a path to a file
+                    if self._credentials_json.strip().startswith("{"):
+                        creds_info = json.loads(self._credentials_json)
+                        credentials = service_account.Credentials.from_service_account_info(
+                            creds_info, scopes=SCOPES
+                        )
+                    elif Path(self._credentials_json).exists():
+                        credentials = service_account.Credentials.from_service_account_file(
+                            self._credentials_json, scopes=SCOPES
+                        )
+                except json.JSONDecodeError:
+                    # If it's not JSON, maybe it's a path that doesn't exist?
+                    self._logger.warning(
+                        "credentials_json string is not valid JSON and not a valid file path",
+                    )
+
+            elif isinstance(self._credentials_json, dict):
+                credentials = service_account.Credentials.from_service_account_info(
+                    self._credentials_json, scopes=SCOPES
+                )
+
+        # Fall back to credentials_path
+        if not credentials and self._credentials_path:
+            creds_path = Path(self._credentials_path)
+            if creds_path.exists():
+                credentials = service_account.Credentials.from_service_account_file(
+                    str(creds_path), scopes=SCOPES
+                )
+
+        if not credentials:
+            raise PlayStoreClientError(
+                "No valid credentials found. Set GOOGLE_APPLICATION_CREDENTIALS (path) "
+                "or GOOGLE_PLAY_STORE_CREDENTIALS (JSON or path)."
+            )
+
+        return credentials
+
     @retry_with_backoff
     def _get_service(self) -> AndroidPublisherResource:
         """Get or create the API service instance."""
@@ -388,46 +510,7 @@ class PlayStoreClient:
         self._logger.info("Initializing Google Play Developer API client")
 
         try:
-            credentials = None
-
-            # Try credentials_json first (from string or dict)
-            if self._credentials_json:
-                if isinstance(self._credentials_json, str):
-                    try:
-                        # Check if it's actually JSON or a path to a file
-                        if self._credentials_json.strip().startswith("{"):
-                            creds_info = json.loads(self._credentials_json)
-                            credentials = service_account.Credentials.from_service_account_info(
-                                creds_info, scopes=SCOPES
-                            )
-                        elif Path(self._credentials_json).exists():
-                            credentials = service_account.Credentials.from_service_account_file(
-                                self._credentials_json, scopes=SCOPES
-                            )
-                    except json.JSONDecodeError:
-                        # If it's not JSON, maybe it's a path that doesn't exist?
-                        self._logger.warning(
-                            "credentials_json string is not valid JSON and not a valid file path",
-                        )
-
-                elif isinstance(self._credentials_json, dict):
-                    credentials = service_account.Credentials.from_service_account_info(
-                        self._credentials_json, scopes=SCOPES
-                    )
-
-            # Fall back to credentials_path
-            if not credentials and self._credentials_path:
-                creds_path = Path(self._credentials_path)
-                if creds_path.exists():
-                    credentials = service_account.Credentials.from_service_account_file(
-                        str(creds_path), scopes=SCOPES
-                    )
-
-            if not credentials:
-                raise PlayStoreClientError(
-                    "No valid credentials found. Set GOOGLE_APPLICATION_CREDENTIALS (path) "
-                    "or GOOGLE_PLAY_STORE_CREDENTIALS (JSON or path)."
-                )
+            credentials = self._load_credentials()
 
             self._service = build(
                 "androidpublisher",
@@ -443,7 +526,39 @@ class PlayStoreClient:
             self._logger.exception("Failed to initialize API client", error=str(e))
             raise PlayStoreClientError(f"Failed to initialize API client: {e}") from e
 
-    def _execute(self, request: Any) -> Any:
+    @retry_with_backoff
+    def _get_reporting_service(self) -> PlaydeveloperreportingResource:
+        """Get or create the Play Developer Reporting API service instance.
+
+        Android vitals live on a separate API (playdeveloperreporting v1beta1)
+        from androidpublisher, so they need their own discovery build. Cached
+        and lazily built exactly like :meth:`_get_service`, from the same
+        credentials — building it costs a discovery fetch, so a deployment that
+        never asks for vitals never pays for it.
+        """
+        if self._reporting_service is not None:
+            return self._reporting_service
+
+        self._logger.info("Initializing Google Play Developer Reporting API client")
+
+        try:
+            credentials = self._load_credentials()
+
+            self._reporting_service = build(
+                REPORTING_API_NAME,
+                REPORTING_API_VERSION,
+                credentials=credentials,
+                cache_discovery=False,
+            )
+            self._logger.info("Reporting API client initialized successfully")
+            return self._reporting_service  # type: ignore[return-value]
+        except Exception as e:
+            if isinstance(e, PlayStoreClientError):
+                raise
+            self._logger.exception("Failed to initialize Reporting API client", error=str(e))
+            raise PlayStoreClientError(f"Failed to initialize Reporting API client: {e}") from e
+
+    def _execute(self, request: Any, *, retry_server_errors: bool | None = None) -> Any:
         """Execute a googleapiclient request with retry/backoff.
 
         All Play API calls go through here. 429 (rate limited) is always
@@ -453,9 +568,16 @@ class PlayStoreClient:
         the server may have already applied it and a retry could duplicate the
         side effect. Non-transient errors (e.g. 400/403/404) propagate to each
         caller's own ``except HttpError`` handling.
+
+        Args:
+            request: The googleapiclient request to execute.
+            retry_server_errors: Override the HTTP-method-based decision above.
+                Only used by the read-only Reporting API, whose ``:query``
+                methods are POSTs that write nothing and so are safe to retry.
         """
-        method = (getattr(request, "method", "") or "").upper()
-        retry_server_errors = method in _IDEMPOTENT_HTTP_METHODS
+        if retry_server_errors is None:
+            method = (getattr(request, "method", "") or "").upper()
+            retry_server_errors = method in _IDEMPOTENT_HTTP_METHODS
 
         def _locked_execute() -> Any:
             # Hold the lock only around the actual transport call, not the
@@ -1794,270 +1916,6 @@ class PlayStoreClient:
         )
 
     # =========================================================================
-    # In-App Products API
-    # =========================================================================
-
-    def list_in_app_products(self, package_name: str) -> list[InAppProduct]:
-        """List in-app products for an app.
-
-        Args:
-            package_name: App package name.
-
-        Returns:
-            List of in-app products.
-        """
-        self._logger.info("Listing in-app products", package_name=package_name)
-        service = self._get_service()
-
-        try:
-            products: list[InAppProduct] = []
-            # inappproducts.list paginates via tokenPagination.nextPageToken
-            # (the older shape), not a top-level nextPageToken.
-            token: str | None = None
-            while True:
-                kwargs: dict[str, Any] = {"packageName": package_name}
-                if token:
-                    kwargs["token"] = token
-                result = self._execute(service.inappproducts().list(**kwargs))
-                products.extend(
-                    self._parse_in_app_product(package_name, product_data)
-                    for product_data in result.get("inappproduct", [])
-                )
-                token = result.get("tokenPagination", {}).get("nextPageToken")
-                if not token:
-                    break
-
-            return products
-
-        except HttpError as e:
-            self._logger.exception("Failed to list in-app products", error=str(e))
-            raise PlayStoreClientError(f"Failed to list in-app products: {e.reason}") from e
-
-    def get_in_app_product(self, package_name: str, sku: str) -> InAppProduct:
-        """Get details of a specific in-app product.
-
-        Args:
-            package_name: App package name.
-            sku: Product SKU.
-
-        Returns:
-            In-app product details.
-        """
-        self._logger.info("Getting in-app product", package_name=package_name, sku=sku)
-        service = self._get_service()
-
-        try:
-            product_data = self._execute(
-                service.inappproducts().get(packageName=package_name, sku=sku)
-            )
-            return self._parse_in_app_product(package_name, product_data)
-
-        except HttpError as e:
-            self._logger.exception("Failed to get in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to get in-app product: {e.reason}") from e
-
-    @staticmethod
-    def _parse_in_app_product(package_name: str, product_data: dict[str, Any]) -> InAppProduct:
-        """Parse an InappProduct API resource into an InAppProduct model."""
-        # Get default price if available
-        default_price = None
-        if "defaultPrice" in product_data:
-            default_price = product_data["defaultPrice"]
-
-        # Get localized listings
-        listings = product_data.get("listings", {})
-        default_listing = listings.get(product_data.get("defaultLanguage", "en-US"), {})
-
-        return InAppProduct(
-            sku=product_data.get("sku", ""),
-            package_name=package_name,
-            product_type=product_data.get("purchaseType", "managedProduct"),
-            status=product_data.get("status"),
-            default_language=product_data.get("defaultLanguage"),
-            title=default_listing.get("title"),
-            description=default_listing.get("description"),
-            default_price=default_price,
-        )
-
-    def create_in_app_product(self, package_name: str, product: dict[str, Any]) -> InAppProduct:
-        """Create a new in-app product.
-
-        Args:
-            package_name: App package name.
-            product: In-app product body (InAppProduct resource).
-
-        Returns:
-            The created in-app product.
-        """
-        self._logger.info("Creating in-app product", package_name=package_name)
-        service = self._get_service()
-
-        try:
-            result = self._execute(
-                service.inappproducts().insert(packageName=package_name, body=product)
-            )
-            return self._parse_in_app_product(package_name, result)
-
-        except HttpError as e:
-            self._logger.exception("Failed to create in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to create in-app product: {e.reason}") from e
-
-    def update_in_app_product(
-        self,
-        package_name: str,
-        sku: str,
-        product: dict[str, Any],
-        auto_convert_missing_prices: bool = False,
-    ) -> InAppProduct:
-        """Update (replace) an existing in-app product.
-
-        Args:
-            package_name: App package name.
-            sku: Product SKU.
-            product: In-app product body (InAppProduct resource).
-            auto_convert_missing_prices: If True, auto-convert prices for regions
-                without a specified price based on the default price.
-
-        Returns:
-            The updated in-app product.
-        """
-        self._logger.info("Updating in-app product", package_name=package_name, sku=sku)
-        service = self._get_service()
-
-        try:
-            result = self._execute(
-                service.inappproducts().update(
-                    packageName=package_name,
-                    sku=sku,
-                    autoConvertMissingPrices=auto_convert_missing_prices,
-                    body=product,
-                )
-            )
-            return self._parse_in_app_product(package_name, result)
-
-        except HttpError as e:
-            self._logger.exception("Failed to update in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to update in-app product: {e.reason}") from e
-
-    def patch_in_app_product(
-        self, package_name: str, sku: str, product: dict[str, Any]
-    ) -> InAppProduct:
-        """Partially update an existing in-app product.
-
-        Args:
-            package_name: App package name.
-            sku: Product SKU.
-            product: Partial in-app product body (InAppProduct resource).
-
-        Returns:
-            The patched in-app product.
-        """
-        self._logger.info("Patching in-app product", package_name=package_name, sku=sku)
-        service = self._get_service()
-
-        try:
-            result = self._execute(
-                service.inappproducts().patch(packageName=package_name, sku=sku, body=product)
-            )
-            return self._parse_in_app_product(package_name, result)
-
-        except HttpError as e:
-            self._logger.exception("Failed to patch in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to patch in-app product: {e.reason}") from e
-
-    def delete_in_app_product(self, package_name: str, sku: str) -> InAppProductActionResult:
-        """Delete an in-app product.
-
-        Args:
-            package_name: App package name.
-            sku: Product SKU.
-
-        Returns:
-            Action result with success status.
-        """
-        self._logger.info("Deleting in-app product", package_name=package_name, sku=sku)
-        service = self._get_service()
-
-        try:
-            self._execute(service.inappproducts().delete(packageName=package_name, sku=sku))
-
-            return InAppProductActionResult(
-                success=True,
-                package_name=package_name,
-                sku=sku,
-                message=f"In-app product {sku} deleted successfully",
-            )
-
-        except HttpError as e:
-            self._logger.exception("Failed to delete in-app product", error=str(e))
-            raise PlayStoreClientError(f"Failed to delete in-app product: {e.reason}") from e
-
-    def batch_get_in_app_products(self, package_name: str, skus: list[str]) -> list[InAppProduct]:
-        """Get details for multiple in-app products.
-
-        Args:
-            package_name: App package name.
-            skus: List of product SKUs to retrieve.
-
-        Returns:
-            List of in-app products, in the same order as the request.
-        """
-        self._logger.info(
-            "Batch getting in-app products", package_name=package_name, count=len(skus)
-        )
-        service = self._get_service()
-
-        try:
-            result = self._execute(
-                service.inappproducts().batchGet(packageName=package_name, sku=skus)
-            )
-
-            return [
-                self._parse_in_app_product(package_name, product_data)
-                for product_data in result.get("inappproduct", [])
-            ]
-
-        except HttpError as e:
-            self._logger.exception("Failed to batch get in-app products", error=str(e))
-            raise PlayStoreClientError(f"Failed to batch get in-app products: {e.reason}") from e
-
-    def batch_delete_in_app_products(
-        self, package_name: str, skus: list[str]
-    ) -> InAppProductActionResult:
-        """Delete multiple in-app products in a single operation.
-
-        Args:
-            package_name: App package name.
-            skus: List of product SKUs to delete.
-
-        Returns:
-            Action result with success status.
-        """
-        self._logger.info(
-            "Batch deleting in-app products", package_name=package_name, count=len(skus)
-        )
-        service = self._get_service()
-
-        try:
-            self._execute(
-                service.inappproducts().batchDelete(
-                    packageName=package_name,
-                    body={"requests": [{"packageName": package_name, "sku": s} for s in skus]},
-                )
-            )
-
-            return InAppProductActionResult(
-                success=True,
-                package_name=package_name,
-                sku=None,
-                message=f"Deleted {len(skus)} in-app product(s) successfully",
-            )
-
-        except HttpError as e:
-            self._logger.exception("Failed to batch delete in-app products", error=str(e))
-            raise PlayStoreClientError(f"Failed to batch delete in-app products: {e.reason}") from e
-
-    # =========================================================================
     # One-Time Product Catalog API
     # =========================================================================
 
@@ -2174,36 +2032,51 @@ class PlayStoreClient:
         product: dict[str, Any],
         update_mask: str,
         regions_version: str = "2022/02",
+        allow_missing: bool = False,
+        latency_tolerance: str | None = None,
     ) -> OneTimeProduct:
-        """Create or update a one-time product (patch is create-or-update).
+        """Update a one-time product, optionally creating it if missing.
+
+        This replaces the retired ``inappproducts.insert``/``update`` pair: the
+        one-time product resource has no insert method, so a create is a patch
+        with ``allow_missing=True``.
 
         Args:
             package_name: App package name.
             product_id: One-time product ID.
             product: Partial OneTimeProduct resource body.
-            update_mask: Comma-separated list of fields to update.
+            update_mask: Comma-separated list of fields to update. Ignored by the
+                API when a new product is created via ``allow_missing``.
             regions_version: Version of available regions to use for regional prices.
+            allow_missing: If True, create the product when it does not exist
+                (upsert). If False, patching a missing product fails.
+            latency_tolerance: Optional propagation latency tolerance, e.g.
+                "PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_SENSITIVE".
 
         Returns:
             The patched one-time product.
         """
         self._logger.info(
-            "Patching one-time product", package_name=package_name, product_id=product_id
+            "Patching one-time product",
+            package_name=package_name,
+            product_id=product_id,
+            allow_missing=allow_missing,
         )
         service = self._get_service()
 
+        kwargs: dict[str, Any] = {
+            "packageName": package_name,
+            "productId": product_id,
+            "updateMask": update_mask,
+            "regionsVersion_version": regions_version,
+            "allowMissing": allow_missing,
+            "body": product,
+        }
+        if latency_tolerance:
+            kwargs["latencyTolerance"] = latency_tolerance
+
         try:
-            result = self._execute(
-                service.monetization()
-                .onetimeproducts()
-                .patch(
-                    packageName=package_name,
-                    productId=product_id,
-                    updateMask=update_mask,
-                    regionsVersion_version=regions_version,
-                    body=product,
-                )
-            )
+            result = self._execute(service.monetization().onetimeproducts().patch(**kwargs))
             return self._parse_one_time_product(package_name, result)
 
         except HttpError as e:
@@ -5972,3 +5845,647 @@ class PlayStoreClient:
             raise PlayStoreClientError(
                 f"Failed to upload internal app sharing bundle: {e.reason}"
             ) from e
+
+    # =========================================================================
+    # Play Developer Reporting API (Android vitals)
+    # =========================================================================
+    #
+    # Read-only by construction: the playdeveloperreporting v1beta1 surface has
+    # no write methods at all (only get/query/search/list), so nothing below can
+    # change anything in Play Console. Do not add one — a mutation would have to
+    # go through androidpublisher above.
+    #
+    # Quota: the API allows roughly 10 queries per second by default. That is
+    # small enough that fan-out patterns break it — one query per dimension
+    # value, or one query per metric set per version code, will start returning
+    # 429s. Prefer a single query that asks for several metrics and slices them
+    # with `dimensions`, which costs one request no matter how many rows come
+    # back. Pagination is bounded by each method's `max_results` for the same
+    # reason: requests stop once enough items are collected, so a wide query
+    # cannot quietly drain the quota.
+
+    @staticmethod
+    def _reporting_name(package_name: str, resource: str | None = None) -> str:
+        """Build a Reporting API resource name.
+
+        Args:
+            package_name: App package name.
+            resource: Optional child resource ID (e.g. "crashRateMetricSet").
+
+        Returns:
+            "apps/{package_name}" or "apps/{package_name}/{resource}".
+        """
+        if resource:
+            return f"apps/{package_name}/{resource}"
+        return f"apps/{package_name}"
+
+    @staticmethod
+    def _reporting_datetime(value: str, field: str) -> dict[str, int]:
+        """Parse a date bound into a google.type.DateTime dict.
+
+        Args:
+            value: "YYYY-MM-DD", or "YYYY-MM-DDTHH" for hourly aggregation.
+            field: Parameter name, used in the error message.
+
+        Returns:
+            A DateTime dict with year/month/day, plus hours when an hour was
+            given. Fields are left unset rather than zeroed because the API
+            rejects an hours field on DAILY timelines.
+
+        Raises:
+            PlayStoreClientError: If the value is not a supported date format.
+        """
+        text = value.strip()
+        for date_format, has_hour in _REPORTING_DATE_FORMATS:
+            try:
+                # Naive on purpose: the API takes a bare calendar date and
+                # applies the metric set's own timezone to it.
+                parsed = datetime.strptime(text, date_format)
+            except ValueError:
+                continue
+            date_time = {"year": parsed.year, "month": parsed.month, "day": parsed.day}
+            if has_hour:
+                date_time["hours"] = parsed.hour
+            return date_time
+
+        raise PlayStoreClientError(
+            f"Invalid {field} '{value}'. Expected YYYY-MM-DD, or YYYY-MM-DDTHH for "
+            "HOURLY aggregation."
+        )
+
+    @classmethod
+    def _reporting_timeline_spec(
+        cls,
+        start_date: str | None,
+        end_date: str | None,
+        aggregation_period: str | None,
+    ) -> dict[str, Any]:
+        """Build a TimelineSpec from the date bounds, or {} if none were given.
+
+        Raises:
+            PlayStoreClientError: If the aggregation period is unknown, or a
+                DAILY timeline was given an hour (which the API rejects,
+                because a daily point is identified by its date alone).
+        """
+        spec: dict[str, Any] = {}
+
+        if aggregation_period:
+            if aggregation_period not in _REPORTING_AGGREGATION_PERIODS:
+                raise PlayStoreClientError(
+                    f"Invalid aggregation_period '{aggregation_period}'. Valid periods: "
+                    f"{', '.join(sorted(_REPORTING_AGGREGATION_PERIODS))}."
+                )
+            spec["aggregationPeriod"] = aggregation_period
+
+        for key, value, field in (
+            ("startTime", start_date, "start_date"),
+            ("endTime", end_date, "end_date"),
+        ):
+            if not value:
+                continue
+            date_time = cls._reporting_datetime(value, field)
+            if aggregation_period == "DAILY" and "hours" in date_time:
+                raise PlayStoreClientError(
+                    f"Invalid {field} '{value}'. DAILY aggregation expects a date without "
+                    "an hour (YYYY-MM-DD); use HOURLY aggregation for hour-level data."
+                )
+            spec[key] = date_time
+
+        return spec
+
+    @classmethod
+    def _reporting_interval_params(
+        cls,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> dict[str, int]:
+        """Build the flattened `interval.*` query params for the error searches.
+
+        The error searches take the interval as query parameters rather than a
+        request body, so googleapiclient exposes each leaf field as its own
+        keyword argument (``interval.startTime.year`` -> ``interval_startTime_year``).
+        """
+        params: dict[str, int] = {}
+        for bound, value, field in (
+            ("startTime", start_date, "start_date"),
+            ("endTime", end_date, "end_date"),
+        ):
+            if not value:
+                continue
+            for name, number in cls._reporting_datetime(value, field).items():
+                params[f"interval_{bound}_{name}"] = number
+        return params
+
+    @staticmethod
+    def _reporting_report_filter(
+        issue_id: str | None,
+        filter_expression: str | None,
+    ) -> str | None:
+        """Combine an issue ID and a caller filter into one AIP-160 expression.
+
+        The reports search has no issue parameter of its own — scoping to an
+        issue is expressed as a filter over ``errorIssueId`` — so the issue_id
+        convenience argument has to be folded into whatever filter the caller
+        supplied. Joining with AND needs no parentheses: the API's filter grammar
+        is conjunctive normal form, where OR binds tighter than AND.
+
+        Args:
+            issue_id: Bare issue ID, or the full "apps/{package}/{issue}"
+                resource name as returned in an ErrorIssue's ``name``.
+            filter_expression: Caller-supplied filter, if any.
+
+        Returns:
+            The combined filter, or None when neither was given.
+        """
+        clauses: list[str] = []
+
+        if issue_id:
+            # Accept the resource name too: that is the form the API hands back,
+            # so it is the form a caller most easily copies from a response.
+            bare_id = issue_id.rsplit("/", 1)[-1]
+            escaped = bare_id.replace("\\", "\\\\").replace('"', '\\"')
+            clauses.append(f'errorIssueId = "{escaped}"')
+
+        if filter_expression:
+            clauses.append(filter_expression)
+
+        if not clauses:
+            return None
+        return " AND ".join(clauses)
+
+    def _reporting_metric_set_resource(self, metric_set: str) -> Any:
+        """Resolve the discovery resource that serves a metric set.
+
+        Args:
+            metric_set: Metric set name, e.g. "crashRateMetricSet".
+
+        Returns:
+            The googleapiclient resource exposing .get()/.query() for it.
+
+        Raises:
+            PlayStoreClientError: If the metric set name is not recognized.
+        """
+        path = _REPORTING_METRIC_SET_RESOURCES.get(metric_set)
+        if path is None:
+            raise PlayStoreClientError(
+                f"Unknown metric set '{metric_set}'. Valid metric sets: "
+                f"{', '.join(REPORTING_METRIC_SETS)}."
+            )
+
+        resource: Any = self._get_reporting_service()
+        for attribute in path:
+            resource = getattr(resource, attribute)()
+        return resource
+
+    def _execute_reporting(self, request: Any) -> Any:
+        """Execute a Reporting API request with retry/backoff.
+
+        Every Reporting method is a read — including the ``:query`` POSTs, which
+        carry a request body only because the query is too big for a URL — so a
+        5xx is always safe to retry here, unlike the publishing API where a
+        retried POST could duplicate a write.
+        """
+        return self._execute(request, retry_server_errors=True)
+
+    def _reporting_paginate(
+        self,
+        make_request: Callable[[int, str | None], Any],
+        data_key: str,
+        max_results: int,
+        max_page_size: int,
+    ) -> dict[str, Any]:
+        """Collect up to ``max_results`` items across pages.
+
+        Args:
+            make_request: Builds the request for a (page_size, page_token) pair.
+            data_key: Response field holding each page's items.
+            max_results: Total items to collect before stopping.
+            max_page_size: Largest page the API accepts for this method.
+
+        Returns:
+            A response shaped like a single page: the accumulated items under
+            ``data_key``, plus ``nextPageToken`` when the API says more exist
+            beyond what was collected.
+
+        Raises:
+            PlayStoreClientError: If max_results is not at least 1.
+        """
+        if max_results < 1:
+            raise PlayStoreClientError(f"max_results must be at least 1, got {max_results}.")
+
+        items: list[Any] = []
+        page_token: str | None = None
+
+        while len(items) < max_results:
+            # Ask for only what is still missing, so a small max_results costs
+            # one request rather than a full page's worth of quota.
+            page_size = min(max_results - len(items), max_page_size)
+            result = self._execute_reporting(make_request(page_size, page_token))
+            batch = result.get(data_key) or []
+            items.extend(batch)
+            page_token = result.get("nextPageToken")
+            # Also stop on an empty page: a service that kept returning a token
+            # with no items would otherwise spin this loop forever.
+            if not page_token or not batch:
+                break
+
+        response: dict[str, Any] = {data_key: items[:max_results]}
+        if page_token:
+            response["nextPageToken"] = page_token
+        return response
+
+    @staticmethod
+    def _reporting_error(
+        operation: str, package_name: str, error: HttpError
+    ) -> PlayStoreClientError:
+        """Turn a Reporting API HttpError into an error that names the likely fix.
+
+        A missing Play Console permission is the most common failure here and
+        surfaces as a plain 403, which on its own tells the user nothing about
+        which permission to grant or where.
+        """
+        status = error.resp.status
+
+        if status in (401, 403):
+            detail = (
+                f"access to {package_name} was denied. The service account most likely lacks "
+                f"the Play Console permission {REPORTING_PERMISSION} for this app — grant it "
+                "under Users and permissions in Play Console. Also check that the Google Play "
+                "Developer Reporting API is enabled for the credential's Cloud project."
+            )
+        elif status == 404:
+            detail = (
+                f"no Reporting resource exists for {package_name}. Check the package name, and "
+                "note that vitals only exist for apps that have been published on Google Play."
+            )
+        elif status == 429:
+            detail = (
+                "the Reporting API quota was exhausted (roughly 10 queries per second by "
+                "default). Ask for more metrics and dimensions per query instead of issuing "
+                "one query per dimension value."
+            )
+        else:
+            detail = str(error.reason)
+
+        return PlayStoreClientError(f"Failed to {operation}: {detail}")
+
+    @staticmethod
+    def _reporting_note_if_empty(
+        result: dict[str, Any],
+        data_key: str,
+        package_name: str,
+    ) -> dict[str, Any]:
+        """Explain an empty Reporting response in the response itself.
+
+        "No data" and "you cannot see this app's data" are indistinguishable to
+        a caller: both come back as a successful, empty payload (a credential
+        without the app-quality permission gets 403 on some resources and an
+        empty result on others). So an empty result carries a ``note`` telling
+        the caller what to check, rather than looking like a healthy app.
+        """
+        if result.get(data_key):
+            return result
+
+        result["note"] = (
+            f"No {data_key} returned for {package_name}. Likely causes: the app has too little "
+            "traffic for Play to report on, the requested time range is outside the data's "
+            "freshness window (check get_metric_set_freshness), the filter matched nothing, or "
+            f"the service account lacks the Play Console permission {REPORTING_PERMISSION} for "
+            "this app."
+        )
+        return result
+
+    def get_metric_set_freshness(self, package_name: str, metric_set: str) -> dict[str, Any]:
+        """Get a metric set's freshness info: how up to date its data is.
+
+        Worth calling before querying: vitals data lags real time by hours to
+        days depending on the metric set and aggregation period, so an empty
+        query result is often just a range that runs past the latest data.
+
+        Args:
+            package_name: App package name.
+            metric_set: Metric set name, one of REPORTING_METRIC_SETS
+                (e.g. "crashRateMetricSet").
+
+        Returns:
+            The raw metric set resource dict (``name`` and ``freshnessInfo``,
+            which lists the latest available end time per aggregation period).
+            A ``note`` key is added when no freshness info came back.
+
+        Raises:
+            PlayStoreClientError: If the metric set is unknown or the API call fails.
+        """
+        self._logger.info(
+            "Getting metric set freshness",
+            package_name=package_name,
+            metric_set=metric_set,
+        )
+        resource = self._reporting_metric_set_resource(metric_set)
+        name = self._reporting_name(package_name, metric_set)
+
+        try:
+            result: dict[str, Any] = self._execute_reporting(resource.get(name=name))
+            return self._reporting_note_if_empty(result, "freshnessInfo", package_name)
+
+        except HttpError as e:
+            self._logger.exception("Failed to get metric set freshness", error=str(e))
+            raise self._reporting_error(f"get freshness for {metric_set}", package_name, e) from e
+
+    def query_metric_set(
+        self,
+        package_name: str,
+        metric_set: str,
+        metrics: list[str],
+        dimensions: list[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        aggregation_period: str | None = None,
+        filter_expression: str | None = None,
+        user_cohort: str | None = None,
+        max_results: int = 1000,
+    ) -> dict[str, Any]:
+        """Query a metric set for timeline data.
+
+        One call can return several metrics sliced by several dimensions, which
+        is the quota-friendly shape — see the quota note at the top of this
+        section before looping over dimension values.
+
+        Args:
+            package_name: App package name.
+            metric_set: Metric set name, one of REPORTING_METRIC_SETS
+                (e.g. "crashRateMetricSet").
+            metrics: Metrics to aggregate, e.g. ["crashRate", "distinctUsers"].
+                Valid names differ per metric set.
+            dimensions: Dimensions to slice by, e.g. ["versionCode", "deviceModel"].
+                Each dimension multiplies the row count, not the request count.
+            start_date: Inclusive start of the timeline. "YYYY-MM-DD" for DAILY,
+                "YYYY-MM-DDTHH" for HOURLY.
+            end_date: Exclusive end of the timeline, same format as start_date.
+            aggregation_period: "HOURLY", "DAILY" or "FULL_RANGE". DAILY buckets
+                use the metric set's own timezone (America/Los_Angeles for most);
+                HOURLY buckets are always UTC.
+            filter_expression: AIP-160 filter over the dimensions (the API's
+                ``filter``), e.g. 'versionCode = 123'.
+            user_cohort: "OS_PUBLIC" (default), "OS_BETA" or "APP_TESTERS". Not
+                supported by errorCountMetricSet.
+            max_results: Maximum rows to return, collected across pages
+                (default: 1000, the API's own page default).
+
+        Returns:
+            The query response dict: ``rows`` (each with its dimensions, metrics
+            and interval start), plus ``nextPageToken`` when more rows exist
+            beyond max_results. A ``note`` key is added when no rows came back.
+
+        Raises:
+            PlayStoreClientError: If an argument is invalid or the API call fails.
+        """
+        if not metrics:
+            raise PlayStoreClientError(
+                f"query_metric_set requires at least one metric for {metric_set}."
+            )
+
+        if user_cohort and metric_set in _REPORTING_METRIC_SETS_WITHOUT_USER_COHORT:
+            raise PlayStoreClientError(
+                f"user_cohort is not supported by {metric_set}; drop it or query a "
+                "rate metric set instead."
+            )
+
+        self._logger.info(
+            "Querying metric set",
+            package_name=package_name,
+            metric_set=metric_set,
+            metrics=metrics,
+            dimensions=dimensions,
+        )
+        resource = self._reporting_metric_set_resource(metric_set)
+        name = self._reporting_name(package_name, metric_set)
+
+        body: dict[str, Any] = {"metrics": metrics}
+        if dimensions:
+            body["dimensions"] = dimensions
+        timeline_spec = self._reporting_timeline_spec(start_date, end_date, aggregation_period)
+        if timeline_spec:
+            body["timelineSpec"] = timeline_spec
+        if filter_expression:
+            body["filter"] = filter_expression
+        if user_cohort:
+            body["userCohort"] = user_cohort
+
+        def make_request(page_size: int, page_token: str | None) -> Any:
+            page_body = dict(body)
+            page_body["pageSize"] = page_size
+            if page_token:
+                page_body["pageToken"] = page_token
+            return resource.query(name=name, body=page_body)
+
+        try:
+            result = self._reporting_paginate(
+                make_request,
+                "rows",
+                max_results,
+                _REPORTING_MAX_PAGE_SIZE_METRICS,
+            )
+            return self._reporting_note_if_empty(result, "rows", package_name)
+
+        except HttpError as e:
+            self._logger.exception("Failed to query metric set", error=str(e))
+            raise self._reporting_error(f"query {metric_set}", package_name, e) from e
+
+    def search_error_issues(
+        self,
+        package_name: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        filter_expression: str | None = None,
+        order_by: str | None = None,
+        sample_error_report_limit: int | None = None,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        """Search crash/ANR issues — reports grouped by their common cause.
+
+        This is the "top crashes" view: one entry per distinct issue, with the
+        counts that rank it. Use search_error_reports for the individual stack
+        traces behind an issue.
+
+        Args:
+            package_name: App package name.
+            start_date: Inclusive start of the search interval, "YYYY-MM-DD" or
+                "YYYY-MM-DDTHH". Bounds are hour-precision; omit both to let the
+                API apply its own default window.
+            end_date: Exclusive end of the search interval, same format.
+            filter_expression: AIP-160 filter (the API's ``filter``), over fields
+                such as ``apiLevel``, ``versionCode``, ``deviceModel``,
+                ``errorIssueType`` (CRASH, ANR, NON_FATAL).
+            order_by: "errorReportCount" or "distinctUsers", with " asc"/" desc",
+                e.g. "errorReportCount desc".
+            sample_error_report_limit: Sample reports to attach per issue. The
+                API currently accepts only 0 or 1.
+            max_results: Maximum issues to return, collected across pages
+                (default: 50, the API's own page default).
+
+        Returns:
+            The search response dict: ``errorIssues``, plus ``nextPageToken``
+            when more issues exist beyond max_results. A ``note`` key is added
+            when no issues came back.
+
+        Raises:
+            PlayStoreClientError: If an argument is invalid or the API call fails.
+        """
+        self._logger.info(
+            "Searching error issues",
+            package_name=package_name,
+            filter=filter_expression,
+        )
+        service = self._get_reporting_service()
+
+        kwargs: dict[str, Any] = {"parent": self._reporting_name(package_name)}
+        kwargs.update(self._reporting_interval_params(start_date, end_date))
+        if filter_expression:
+            kwargs["filter"] = filter_expression
+        if order_by:
+            kwargs["orderBy"] = order_by
+        if sample_error_report_limit is not None:
+            kwargs["sampleErrorReportLimit"] = sample_error_report_limit
+
+        def make_request(page_size: int, page_token: str | None) -> Any:
+            page_kwargs = dict(kwargs)
+            page_kwargs["pageSize"] = page_size
+            if page_token:
+                page_kwargs["pageToken"] = page_token
+            return service.vitals().errors().issues().search(**page_kwargs)
+
+        try:
+            result = self._reporting_paginate(
+                make_request,
+                "errorIssues",
+                max_results,
+                _REPORTING_MAX_PAGE_SIZE_ISSUES,
+            )
+            return self._reporting_note_if_empty(result, "errorIssues", package_name)
+
+        except HttpError as e:
+            self._logger.exception("Failed to search error issues", error=str(e))
+            raise self._reporting_error("search error issues", package_name, e) from e
+
+    def search_error_reports(
+        self,
+        package_name: str,
+        issue_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        filter_expression: str | None = None,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        """Search individual error reports (single crash/ANR occurrences).
+
+        Args:
+            package_name: App package name.
+            issue_id: Restrict to the reports behind one issue from
+                search_error_issues. Accepts either the bare ID or the full
+                ``apps/{package}/{issue}`` resource name.
+            start_date: Inclusive start of the search interval, "YYYY-MM-DD" or
+                "YYYY-MM-DDTHH". Bounds are hour-precision; omit both to let the
+                API apply its own default window.
+            end_date: Exclusive end of the search interval, same format.
+            filter_expression: AIP-160 filter (the API's ``filter``), over fields
+                such as ``versionCode``, ``deviceModel``, ``errorIssueType``,
+                ``isUserPerceived``. Combined with issue_id when both are given.
+            max_results: Maximum reports to return, collected across pages
+                (default: 50, the API's own page default).
+
+        Returns:
+            The search response dict: ``errorReports``, plus ``nextPageToken``
+            when more reports exist beyond max_results. A ``note`` key is added
+            when no reports came back.
+
+        Raises:
+            PlayStoreClientError: If an argument is invalid or the API call fails.
+        """
+        report_filter = self._reporting_report_filter(issue_id, filter_expression)
+
+        self._logger.info(
+            "Searching error reports",
+            package_name=package_name,
+            filter=report_filter,
+        )
+        service = self._get_reporting_service()
+
+        kwargs: dict[str, Any] = {"parent": self._reporting_name(package_name)}
+        kwargs.update(self._reporting_interval_params(start_date, end_date))
+        if report_filter:
+            kwargs["filter"] = report_filter
+
+        def make_request(page_size: int, page_token: str | None) -> Any:
+            page_kwargs = dict(kwargs)
+            page_kwargs["pageSize"] = page_size
+            if page_token:
+                page_kwargs["pageToken"] = page_token
+            return service.vitals().errors().reports().search(**page_kwargs)
+
+        try:
+            result = self._reporting_paginate(
+                make_request,
+                "errorReports",
+                max_results,
+                _REPORTING_MAX_PAGE_SIZE_REPORTS,
+            )
+            return self._reporting_note_if_empty(result, "errorReports", package_name)
+
+        except HttpError as e:
+            self._logger.exception("Failed to search error reports", error=str(e))
+            raise self._reporting_error("search error reports", package_name, e) from e
+
+    def list_anomalies(
+        self,
+        package_name: str,
+        filter_expression: str | None = None,
+        max_results: int = 10,
+    ) -> dict[str, Any]:
+        """List vitals anomalies Play detected for an app.
+
+        Anomalies are Play's own regression detections (a metric moving well
+        outside its expected range), so this is the cheapest way to ask "did
+        anything get worse?" without querying every metric set.
+
+        Args:
+            package_name: App package name.
+            filter_expression: AIP-160 filter (the API's ``filter``). Supports
+                ``activeBetween(startTime, endTime)`` with RFC-3339 timestamps,
+                e.g. 'activeBetween("2024-01-01T00:00:00Z", UNBOUNDED)'.
+            max_results: Maximum anomalies to return, collected across pages
+                (default: 10, the API's own page default).
+
+        Returns:
+            The list response dict: ``anomalies``, plus ``nextPageToken`` when
+            more anomalies exist beyond max_results. A ``note`` key is added when
+            none came back — which for this method is usually good news.
+
+        Raises:
+            PlayStoreClientError: If an argument is invalid or the API call fails.
+        """
+        self._logger.info("Listing anomalies", package_name=package_name)
+        service = self._get_reporting_service()
+
+        kwargs: dict[str, Any] = {"parent": self._reporting_name(package_name)}
+        if filter_expression:
+            kwargs["filter"] = filter_expression
+
+        def make_request(page_size: int, page_token: str | None) -> Any:
+            page_kwargs = dict(kwargs)
+            page_kwargs["pageSize"] = page_size
+            if page_token:
+                page_kwargs["pageToken"] = page_token
+            return service.anomalies().list(**page_kwargs)
+
+        try:
+            result = self._reporting_paginate(
+                make_request,
+                "anomalies",
+                max_results,
+                _REPORTING_MAX_PAGE_SIZE_ANOMALIES,
+            )
+            return self._reporting_note_if_empty(result, "anomalies", package_name)
+
+        except HttpError as e:
+            self._logger.exception("Failed to list anomalies", error=str(e))
+            raise self._reporting_error("list anomalies", package_name, e) from e

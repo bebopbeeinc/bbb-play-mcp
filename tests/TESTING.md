@@ -16,6 +16,8 @@ All tests in this project use **mocked Google Play API responses** - no live API
 - `tests/test_client.py` - Tests for PlayStoreClient methods (API interactions)
 - `tests/test_server.py` - Tests for MCP server tools
 - `tests/test_models.py` - Tests for Pydantic data models
+- `tests/test_reporting_client.py` - Tests for the Play Developer Reporting API client (Android vitals)
+- `tests/test_vitals.py` - Tests for the Android vitals MCP tools
 - `tests/conftest.py` - Pytest fixtures and mocked dependencies
 
 ### Mocking Strategy
@@ -167,6 +169,42 @@ All integration tests are read-only. They will never modify your Play Console da
 - ✅ Deploy to multiple tracks simultaneously
 - ✅ Track individual results
 
+### Android Vitals Tests (`test_reporting_client.py`, `test_vitals.py`)
+
+Android vitals go through a **second** Google API — `playdeveloperreporting`
+v1beta1 — with its own OAuth scope and its own discovery build, so it gets its
+own mocked service (`client._reporting_service`) rather than the
+androidpublisher one used everywhere else.
+
+#### Client (`test_reporting_client.py`)
+
+- ✅ Both scopes requested; reporting service built separately, cached, and
+  never substituted for the publishing service
+- ✅ Resource names — `apps/{package}/{metricSet}` verified for **all eight**
+  metric sets, each through its own discovery path
+- ✅ Request construction: timeline specs, DAILY vs HOURLY bounds, AIP-160
+  filters, flattened `interval.*` params for the error searches
+- ✅ Argument validation that costs no API call (unknown metric set, bad date
+  format, hour on a DAILY timeline, empty metrics, `user_cohort` on
+  `errorCountMetricSet`)
+- ✅ Pagination up to `max_results`, page-size capping per method, truncation
+  reported via `nextPageToken`, and the empty-page guard against an endless loop
+- ✅ 401/403 name the missing `CAN_VIEW_APP_QUALITY` permission; 404 explains
+  the package name; 429 explains the ~10 QPS quota
+- ✅ Empty results are annotated with likely causes instead of raising
+- ✅ Read-only property: no reporting call ever dispatches a mutating discovery
+  method
+
+#### Tools (`test_vitals.py`)
+
+- ✅ Each tool's returned shape, window, and metric set
+- ✅ Every windowed tool rejects an out-of-range `days` without calling the API
+- ✅ Empty data and permission failures as an MCP caller sees them
+- ✅ Vitals are not gated by `--read-only` (the Reporting API has no writes)
+- ✅ **Quota safety**: `get_vitals_summary` makes exactly three queries, pinned
+  both at the client boundary and at the transport, with no per-dimension
+  fan-out; a `dimensions` breakdown stays a single round trip
+
 ### Server Tests (`test_server.py`)
 
 - ✅ Server module imports correctly
@@ -186,7 +224,7 @@ All integration tests are read-only. They will never modify your Play Console da
 - ✅ Review model (with and without replies)
 - ✅ AppDetails model
 - ✅ SubscriptionProduct model
-- ✅ InAppProduct model
+- ✅ OneTimeProduct model
 - ✅ Listing model
 - ✅ TesterInfo model
 - ✅ Order model

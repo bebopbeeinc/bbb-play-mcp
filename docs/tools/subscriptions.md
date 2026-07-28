@@ -546,37 +546,6 @@ batch_update_subscription_offer_states(
 
 ---
 
-## list_in_app_products
-
-List all in-app products (managed products) for an app.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-
-Each product includes: `sku`, `product_type`, `status`, `title`, `description`, `default_price`
-
-```python
-list_in_app_products("com.example.myapp")
-```
-
----
-
-## get_in_app_product
-
-Get details of a specific in-app product.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-| `sku` | string | Yes | Product SKU identifier |
-
-```python
-get_in_app_product("com.example.myapp", sku="premium_upgrade")
-```
-
----
-
 ## get_product_purchase
 
 Check the status of a one-time (managed) in-app product purchase using a purchase token from the client app.
@@ -628,118 +597,6 @@ consume_product_purchase("com.example.myapp", product_id="coins_100", purchase_t
 
 ---
 
-## In-App Product Management
-
-Create, update, and delete in-app products (managed products) in your catalog.
-All tools here except `batch_get_in_app_products` are writes and are disabled in
-[read-only mode](../configuration.md#read-only-mode).
-
-The `product` parameter is an
-[InAppProduct](https://developers.google.com/android-publisher/api-ref/rest/v3/inappproducts)
-resource body — for example `sku`, `purchaseType` (`managedProduct` or
-`subscription`), `defaultLanguage`, `defaultPrice`, `prices`, `listings`, and
-`status`.
-
-### create_in_app_product
-
-Create a new in-app product. **Write.**
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-| `product` | object | Yes | InAppProduct resource body |
-
-```python
-create_in_app_product(
-    package_name="com.example.myapp",
-    product={
-        "sku": "premium_upgrade",
-        "purchaseType": "managedProduct",
-        "defaultLanguage": "en-US",
-        "status": "active",
-        "defaultPrice": {"priceMicros": "990000", "currency": "USD"},
-        "listings": {"en-US": {"title": "Premium Upgrade", "description": "Unlock everything"}},
-    },
-)
-```
-
-### update_in_app_product
-
-Update (replace) an existing in-app product. **Write.**
-
-| Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `package_name` | string | Yes | — | App package name |
-| `sku` | string | Yes | — | Product SKU identifier |
-| `product` | object | Yes | — | InAppProduct resource body |
-| `auto_convert_missing_prices` | boolean | No | `false` | Auto-convert prices for regions without a specified price from the default price |
-
-```python
-update_in_app_product(
-    package_name="com.example.myapp",
-    sku="premium_upgrade",
-    product={"sku": "premium_upgrade", "status": "active", "defaultPrice": {"priceMicros": "1990000", "currency": "USD"}},
-    auto_convert_missing_prices=True,
-)
-```
-
-### patch_in_app_product
-
-Partially update an existing in-app product. **Write.**
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-| `sku` | string | Yes | Product SKU identifier |
-| `product` | object | Yes | Partial InAppProduct body with only the fields to change |
-
-```python
-patch_in_app_product("com.example.myapp", sku="premium_upgrade", product={"status": "inactive"})
-```
-
-### delete_in_app_product
-
-Delete an in-app product from the catalog. **Write.**
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-| `sku` | string | Yes | Product SKU identifier |
-
-```python
-delete_in_app_product("com.example.myapp", sku="premium_upgrade")
-```
-
-### batch_get_in_app_products
-
-Get details for multiple in-app products at once. Read-only (available in read-only mode).
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-| `skus` | array of string | Yes | Product SKUs to retrieve |
-
-Returns a list of products in the same order as requested.
-
-```python
-batch_get_in_app_products("com.example.myapp", skus=["premium_upgrade", "coins_100"])
-```
-
-### batch_delete_in_app_products
-
-Delete multiple in-app products in a single operation (up to 100). **Write.**
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `package_name` | string | Yes | App package name |
-| `skus` | array of string | Yes | Product SKUs to delete |
-
-```python
-batch_delete_in_app_products("com.example.myapp", skus=["premium_upgrade", "coins_100"])
-```
-
----
-
 ## One-Time Products
 
 Manage one-time products (`monetization.oneTimeProducts`) in your catalog. The
@@ -755,6 +612,26 @@ resource body — for example `listings`, `purchaseOptions`, `offerTags`, and
 `"2022/02"`) identifying the version of available regions used for regional
 prices. One-time-product-returning tools include: `product_id`, `package_name`,
 `listings`, `purchase_options`, `offer_tags`, and `restricted_payment_countries`.
+
+> **Migrated from `inappproducts`.** The `v3.inappproducts` resource is retired —
+> Google answers it with `403 "Please migrate to the new publishing API"` — so the
+> `*_in_app_product(s)` tools were removed in favour of the tools below. The
+> mapping is not a pure rename:
+>
+> | Removed tool | Replacement | Note |
+> |---|---|---|
+> | `list_in_app_products` | `list_one_time_products` | Paging is `pageToken`, not `token` |
+> | `get_in_app_product` | `get_one_time_product` | `sku` → `product_id` |
+> | `batch_get_in_app_products` | `batch_get_one_time_products` | `skus` → `product_ids` |
+> | `create_in_app_product` | `patch_one_time_product(allow_missing=True)` | There is no insert method |
+> | `update_in_app_product` | `patch_one_time_product` with an `update_mask` | There is no update method |
+> | `patch_in_app_product` | `patch_one_time_product` | `update_mask` is now required |
+> | `delete_in_app_product` | `delete_one_time_product` | `sku` → `product_id` |
+> | `batch_delete_in_app_products` | `batch_delete_one_time_products` | Takes request objects, not a `skus` list |
+>
+> The resource body changed shape too: pricing moved out of the flat
+> `defaultPrice`/`prices` fields into `purchaseOptions`, and `listings` is an
+> array rather than a language-keyed object.
 
 ### get_one_time_product
 
@@ -796,23 +673,58 @@ batch_get_one_time_products("com.example.myapp", product_ids=["coins_pack", "gem
 
 ### patch_one_time_product
 
-Create or update a one-time product — for one-time products, `patch` is
-create-or-update. **Write.** Disabled in [read-only mode](../configuration.md#read-only-mode).
+Update a one-time product, optionally creating it if it does not exist. One-time
+products have **no insert method**, so creating a product is a patch with
+`allow_missing=True`. **Write.** Disabled in
+[read-only mode](../configuration.md#read-only-mode).
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `package_name` | string | Yes | — | App package name |
 | `product_id` | string | Yes | — | One-time product ID |
 | `product` | object | Yes | — | Partial OneTimeProduct body with the fields to change |
-| `update_mask` | string | Yes | — | Comma-separated list of fields to update |
+| `update_mask` | string | Yes | — | Comma-separated list of fields to update. Ignored by the API when `allow_missing` creates a new product |
 | `regions_version` | string | No | `"2022/02"` | Version of available regions for regional prices |
+| `allow_missing` | boolean | No | `false` | Create the product when it does not exist (upsert) |
+| `latency_tolerance` | string | No | — | Propagation latency tolerance, e.g. `"PRODUCT_UPDATE_LATENCY_TOLERANCE_LATENCY_SENSITIVE"` |
+
+`update_mask` is deliberately required: a patch without a mask is ambiguous about
+which fields you meant to change.
 
 ```python
+# Update an existing product.
 patch_one_time_product(
     package_name="com.example.myapp",
     product_id="coins_pack",
     product={"listings": [{"languageCode": "en-US", "title": "Coins Pack"}]},
     update_mask="listings",
+)
+
+# Create a product (the replacement for the removed create_in_app_product).
+patch_one_time_product(
+    package_name="com.example.myapp",
+    product_id="coins_pack",
+    product={
+        "productId": "coins_pack",
+        "listings": [
+            {"languageCode": "en-US", "title": "Coins Pack", "description": "100 coins"}
+        ],
+        "purchaseOptions": [
+            {
+                "purchaseOptionId": "standard",
+                "buyOption": {},
+                "regionalPricingAndAvailabilityConfigs": [
+                    {
+                        "regionCode": "US",
+                        "price": {"currencyCode": "USD", "units": "1", "nanos": 990000000},
+                        "availability": "AVAILABLE",
+                    }
+                ],
+            }
+        ],
+    },
+    update_mask="listings,purchaseOptions",
+    allow_missing=True,
 )
 ```
 

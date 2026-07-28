@@ -511,23 +511,6 @@ class TestPagination:
         assert list_mock.call_count == 2
         assert list_mock.call_args_list[1].kwargs["pageToken"] == "tok"
 
-    def test_list_one_time_products_paginates(
-        self,
-        client: PlayStoreClient,
-        _mock_service: MagicMock,
-    ) -> None:
-        list_mock = _mock_service.monetization.return_value.onetimeproducts.return_value.list
-        list_mock.return_value.execute.side_effect = [
-            {"oneTimeProducts": [{"productId": "p1"}], "nextPageToken": "tok"},
-            {"oneTimeProducts": [{"productId": "p2"}]},
-        ]
-
-        result = client.list_one_time_products("com.example.app")
-
-        assert [p.product_id for p in result] == ["p1", "p2"]
-        assert list_mock.call_count == 2
-        assert list_mock.call_args_list[1].kwargs["pageToken"] == "tok"
-
     def test_list_purchase_option_offers_paginates(
         self,
         client: PlayStoreClient,
@@ -602,24 +585,6 @@ class TestPagination:
         assert list_mock.call_count == 2
         assert list_mock.call_args_list[0].kwargs["parent"] == "developers/dev-123"
         assert list_mock.call_args_list[1].kwargs["pageToken"] == "tok"
-
-    def test_list_in_app_products_paginates(
-        self,
-        client: PlayStoreClient,
-        _mock_service: MagicMock,
-    ) -> None:
-        """inappproducts.list paginates via tokenPagination.nextPageToken (older shape)."""
-        list_mock = _mock_service.inappproducts.return_value.list
-        list_mock.return_value.execute.side_effect = [
-            {"inappproduct": [{"sku": "p1"}], "tokenPagination": {"nextPageToken": "tok"}},
-            {"inappproduct": [{"sku": "p2"}]},
-        ]
-
-        result = client.list_in_app_products("com.example.app")
-
-        assert [p.sku for p in result] == ["p1", "p2"]
-        assert list_mock.call_count == 2
-        assert list_mock.call_args_list[1].kwargs["token"] == "tok"
 
     def test_get_reviews_paginates(
         self,

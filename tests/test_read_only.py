@@ -138,22 +138,16 @@ WRITE_TOOLS = [
         {"package_name": "com.example.app", "purchase_token": "tok"},
     ),
     (
-        "create_in_app_product",
-        {"package_name": "com.example.app", "product": {"sku": "sku1"}},
+        "patch_one_time_product",
+        {
+            "package_name": "com.example.app",
+            "product_id": "coins_pack",
+            "product": {"productId": "coins_pack"},
+            "update_mask": "listings",
+        },
     ),
-    (
-        "update_in_app_product",
-        {"package_name": "com.example.app", "sku": "sku1", "product": {"sku": "sku1"}},
-    ),
-    (
-        "patch_in_app_product",
-        {"package_name": "com.example.app", "sku": "sku1", "product": {"status": "active"}},
-    ),
-    ("delete_in_app_product", {"package_name": "com.example.app", "sku": "sku1"}),
-    (
-        "batch_delete_in_app_products",
-        {"package_name": "com.example.app", "skus": ["sku1", "sku2"]},
-    ),
+    # The upsert (create) path is a patch with allow_missing, so it must be
+    # blocked too -- this is what replaced the removed create_in_app_product.
     (
         "patch_one_time_product",
         {
@@ -161,6 +155,7 @@ WRITE_TOOLS = [
             "product_id": "coins_pack",
             "product": {"productId": "coins_pack"},
             "update_mask": "listings",
+            "allow_missing": True,
         },
     ),
     (

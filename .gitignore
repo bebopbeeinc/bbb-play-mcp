@@ -107,3 +107,6 @@ credentials*.json
 
 # uv
 .uv/
+
+# MkDocs build output
+site/

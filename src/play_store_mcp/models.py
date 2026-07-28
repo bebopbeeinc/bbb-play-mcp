@@ -118,29 +118,6 @@ class VoidedPurchase(BaseModel):
     voided_source: int | None = Field(None, description="Source of voiding")
 
 
-class InAppProduct(BaseModel):
-    """In-app product definition."""
-
-    sku: str = Field(..., description="Product SKU")
-    package_name: str = Field(..., description="App package name")
-    product_type: str = Field(..., description="Product type (managed_product or subscription)")
-    status: str | None = Field(None, description="Product status")
-    default_language: str | None = Field(None, description="Default language")
-    title: str | None = Field(None, description="Product title")
-    description: str | None = Field(None, description="Product description")
-    default_price: dict[str, Any] | None = Field(None, description="Default price information")
-
-
-class InAppProductActionResult(BaseModel):
-    """Result of a delete/batch-delete action on in-app products."""
-
-    success: bool = Field(..., description="Whether the action succeeded")
-    package_name: str = Field(..., description="App package name")
-    sku: str | None = Field(None, description="Product SKU (None for batch operations)")
-    message: str = Field(..., description="Status message")
-    error: str | None = Field(None, description="Error details if failed")
-
-
 class Listing(BaseModel):
     """Store listing for a specific language."""
 

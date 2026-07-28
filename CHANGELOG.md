@@ -12,11 +12,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- Consolidate and reduce the MCP tool surface (now 117 tools) by grouping
+- Consolidate and reduce the MCP tool surface (now 118 tools) by grouping
   related operations, to lower per-request tool-list overhead — with no planned
   loss of functionality.
+- Contribute the Android vitals tools back to upstream
+  [lusky3/play-store-mcp](https://github.com/lusky3/play-store-mcp).
+
+### Added
+- **Android vitals (Play Developer Reporting API).** Nine read-only tools over
+  `playdeveloperreporting` v1beta1, the API behind the Play Console's Vitals
+  page — which upstream does not cover at all:
+  `get_vitals_summary`, `get_crash_rate`, `get_anr_rate`, `get_slow_start_rate`,
+  `get_excessive_wakeup_rate`, `search_error_issues`, `search_error_reports`,
+  `list_anomalies`, and `get_metric_freshness`. This restores — and this time
+  actually implements — the capability the placeholder `get_vitals_overview` /
+  `get_vitals_metrics` tools removed in 0.5.0 only pretended to have.
+- The `https://www.googleapis.com/auth/playdeveloperreporting` scope is now
+  requested alongside `androidpublisher`, and the Reporting API is built as a
+  **separate** discovery service, lazily — a deployment that never asks for
+  vitals never pays for the extra discovery fetch.
+
+### Requirements
+- Vitals need **two separate gates**, and neither implies the other: the
+  app-level Play Console permission **View app quality information (read-only)**
+  (`CAN_VIEW_APP_QUALITY`), *and* the **Google Play Developer Reporting API**
+  enabled in the service account's Cloud project. A 403 from these tools names
+  both rather than surfacing a bare status code. See the README's Android Vitals
+  section.
 
 ### Changed
+- **Breaking: the in-app product catalog tools were removed in favour of
+  one-time products.** Google has retired the `androidpublisher` v3
+  `inappproducts` resource and answers it with
+  `403 "Please migrate to the new publishing API"` (verified live against
+  `com.bebopbee.trivia.traveltrivia`), so every `*_in_app_product(s)` tool was
+  dead. `monetization.oneTimeProducts` replaces it, and the already-shipped
+  `*_one_time_product(s)` tools are the migration target. The mapping is not a
+  pure rename — see Removed below and the
+  [tool docs](https://lusky3.github.io/play-store-mcp/tools/subscriptions/#one-time-products).
+- `patch_one_time_product` gained `allow_missing` and `latency_tolerance`.
+  `allow_missing=True` is the replacement for the removed
+  `create_in_app_product`: the one-time product resource has **no insert
+  method**, so a create is a patch that is allowed to upsert. `update_mask`
+  stays required and explicit rather than being inferred from the body — a patch
+  without a mask is ambiguous about which fields were meant to change.
 - **Breaking:** APK/AAB downloads are now **always confined to a directory** —
   there is no "write anywhere" mode. The base directory is
   `PLAY_STORE_MCP_DOWNLOAD_DIR` when set, otherwise the server's current working
@@ -25,6 +64,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory. Network transports (`--transport sse` / `streamable-http`)
   additionally **require** `PLAY_STORE_MCP_DOWNLOAD_DIR` to be set explicitly and
   refuse to start without it.
+
+### Removed
+- **Breaking:** the eight in-app product tools and their client methods —
+  `list_in_app_products`, `get_in_app_product`, `batch_get_in_app_products`,
+  `create_in_app_product`, `update_in_app_product`, `patch_in_app_product`,
+  `delete_in_app_product`, `batch_delete_in_app_products` — together with the
+  `InAppProduct` and `InAppProductActionResult` models. Replacements:
+
+  | Removed | Replacement |
+  |---|---|
+  | `list_in_app_products` | `list_one_time_products` (paging is `pageToken`, not `token`) |
+  | `get_in_app_product` | `get_one_time_product` (`sku` → `product_id`) |
+  | `batch_get_in_app_products` | `batch_get_one_time_products` (`skus` → `product_ids`) |
+  | `create_in_app_product` | `patch_one_time_product(allow_missing=True)` |
+  | `update_in_app_product` | `patch_one_time_product` with an `update_mask` |
+  | `patch_in_app_product` | `patch_one_time_product` (`update_mask` now required) |
+  | `delete_in_app_product` | `delete_one_time_product` (`sku` → `product_id`) |
+  | `batch_delete_in_app_products` | `batch_delete_one_time_products` (request objects, not a `skus` list) |
+
+  The identifier changed (`sku` → `product_id`) and so did the resource body:
+  pricing moved out of the flat `defaultPrice`/`prices` fields into
+  `purchaseOptions`, and `listings` is an array rather than a language-keyed
+  object. The old names were deliberately **not** kept as aliases — a
+  `get_in_app_product` that returned a `OneTimeProduct` would be the same name
+  with a different response shape, which is worse than a rename.
 
 ### Security
 - Download-destination confinement lives in `PlayStoreClient` and applies to both

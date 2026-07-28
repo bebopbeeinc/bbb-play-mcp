@@ -13,6 +13,7 @@ An MCP (Model Context Protocol) server that connects to the Google Play Develope
 - 📈 **Release Management** — Promote releases, manage staged rollouts
 - 👥 **Tester Management** — Add and manage testers for testing tracks
 - ⭐ **Review Management** — Fetch and reply to user reviews
+- 📊 **Android Vitals** — Read crash, ANR, startup, and battery metrics, top crash issues, and Play-detected anomalies (read-only)
 - 💳 **Subscriptions** — List subscriptions and check purchase status
 - 🛒 **In-App Products** — List and manage in-app products
 - 📦 **Expansion Files** — Manage APK expansion files for large apps

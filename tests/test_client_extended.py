@@ -1401,57 +1401,6 @@ class TestCredentialsJson:
 
 
 # =========================================================================
-# In-app products error paths
-# =========================================================================
-
-
-class TestInAppProductsErrors:
-    """Test in-app product HttpError handling."""
-
-    def test_list_in_app_products_http_error(
-        self,
-        client: PlayStoreClient,
-        _mock_service: MagicMock,
-    ) -> None:
-        """list_in_app_products wraps HttpError as PlayStoreClientError."""
-        _mock_service.inappproducts.return_value.list.return_value.execute.side_effect = (
-            _make_http_error(403, "forbidden")
-        )
-
-        with pytest.raises(PlayStoreClientError, match="Failed to list in-app products"):
-            client.list_in_app_products("com.example.app")
-
-    def test_get_in_app_product_http_error(
-        self,
-        client: PlayStoreClient,
-        _mock_service: MagicMock,
-    ) -> None:
-        """get_in_app_product wraps HttpError as PlayStoreClientError."""
-        _mock_service.inappproducts.return_value.get.return_value.execute.side_effect = (
-            _make_http_error(404, "not found")
-        )
-
-        with pytest.raises(PlayStoreClientError, match="Failed to get in-app product"):
-            client.get_in_app_product("com.example.app", "sku1")
-
-    def test_get_in_app_product_no_default_price(
-        self,
-        client: PlayStoreClient,
-        _mock_service: MagicMock,
-    ) -> None:
-        """get_in_app_product handles a product without a defaultPrice."""
-        _mock_service.inappproducts.return_value.get.return_value.execute.return_value = {
-            "sku": "sku1",
-            "purchaseType": "managedProduct",
-        }
-
-        product = client.get_in_app_product("com.example.app", "sku1")
-
-        assert product.sku == "sku1"
-        assert product.default_price is None
-
-
-# =========================================================================
 # update_listing with video
 # =========================================================================
 

@@ -55,6 +55,7 @@ nav:
       - Publishing & Deployment: tools/publishing.md
       - Store Listings: tools/store-listings.md
       - Reviews: tools/reviews.md
+      - Android Vitals: tools/vitals.md
       - Subscriptions & IAP: tools/subscriptions.md
       - Testers: tools/testers.md
       - Batch Operations: tools/batch.md

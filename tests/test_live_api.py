@@ -200,15 +200,15 @@ def main() -> None:
         except PlayStoreClientError as e:
             print_info(f"Note: Could not fetch subscriptions: {e}")
 
-        # List in-app products
-        print_test("Listing in-app products")
+        # List one-time products
+        print_test("Listing one-time products")
         try:
-            products = client.list_in_app_products(package_name)
-            print_success(f"Found {len(products)} in-app products")
+            products = client.list_one_time_products(package_name)
+            print_success(f"Found {len(products)} one-time products")
             for product in products:
-                print_info(f"{product.sku}: {product.title}")
+                print_info(f"{product.product_id}")
         except PlayStoreClientError as e:
-            print_info(f"Note: Could not fetch in-app products: {e}")
+            print_info(f"Note: Could not fetch one-time products: {e}")
 
         # Get testers
         print_test("Getting testers for internal track")

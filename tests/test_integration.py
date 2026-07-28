@@ -154,22 +154,22 @@ class TestReadOnlyOperations:
             # Subscriptions might not be available for all apps
             print(f"  Note: Could not fetch subscriptions: {e}")
 
-    def test_list_in_app_products(
+    def test_list_one_time_products(
         self,
         real_client: PlayStoreClient,
         test_package_name: str,
     ) -> None:
-        """Test listing in-app products."""
+        """Test listing one-time products."""
         try:
-            products = real_client.list_in_app_products(test_package_name)
+            products = real_client.list_one_time_products(test_package_name)
             assert isinstance(products, list)
-            print(f"✓ list_in_app_products() returned {len(products)} products")
+            print(f"✓ list_one_time_products() returned {len(products)} products")
 
             for product in products:
-                print(f"  - {product.sku}: {product.title}")
+                print(f"  - {product.product_id}")
         except PlayStoreClientError as e:
-            # IAP might not be available for all apps
-            print(f"  Note: Could not fetch in-app products: {e}")
+            # One-time products might not be available for all apps
+            print(f"  Note: Could not fetch one-time products: {e}")
 
     def test_get_listing(
         self,

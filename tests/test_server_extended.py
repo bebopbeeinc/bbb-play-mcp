@@ -16,7 +16,6 @@ from play_store_mcp.models import (
     BatchDeploymentResult,
     DeploymentResult,
     ExpansionFile,
-    InAppProduct,
     Listing,
     ListingUpdateResult,
     Order,
@@ -36,7 +35,6 @@ from play_store_mcp.server import (
     deploy_app_multilang,
     get_app_details,
     get_expansion_file,
-    get_in_app_product,
     get_listing,
     get_order,
     get_releases,
@@ -44,7 +42,6 @@ from play_store_mcp.server import (
     get_testers,
     halt_release,
     list_all_listings,
-    list_in_app_products,
     list_subscriptions,
     list_voided_purchases,
     mcp,
@@ -60,7 +57,7 @@ from play_store_mcp.server import (
 
 
 def test_server_uses_fastmcp_and_registers_all_tools() -> None:
-    """The server is built on the standalone fastmcp package with all 117 tools."""
+    """The server is built on the standalone fastmcp package with all 118 tools."""
     import asyncio
 
     import fastmcp
@@ -69,7 +66,7 @@ def test_server_uses_fastmcp_and_registers_all_tools() -> None:
 
     assert isinstance(server.mcp, fastmcp.FastMCP)
     tools = asyncio.run(server.mcp.list_tools())  # Sequence[Tool]
-    assert len(tools) == 117
+    assert len(tools) == 118
 
 
 @pytest.fixture
@@ -455,44 +452,6 @@ class TestSubscriptionTools:
             max_results=100,
         )
         assert len(result) == 1
-
-
-# =========================================================================
-# In-App Products tools
-# =========================================================================
-
-
-class TestInAppProductsTools:
-    """Test in-app products server tools."""
-
-    def test_list_in_app_products(self, mock_client: MagicMock) -> None:
-        """Test list_in_app_products tool."""
-        mock_client.list_in_app_products.return_value = [
-            InAppProduct(
-                sku="premium",
-                package_name="com.example.app",
-                product_type="managedProduct",
-            )
-        ]
-
-        result = list_in_app_products("com.example.app")
-
-        mock_client.list_in_app_products.assert_called_once_with("com.example.app")
-        assert len(result) == 1
-
-    def test_get_in_app_product(self, mock_client: MagicMock) -> None:
-        """Test get_in_app_product tool."""
-        mock_client.get_in_app_product.return_value = InAppProduct(
-            sku="premium",
-            package_name="com.example.app",
-            product_type="managedProduct",
-            title="Premium",
-        )
-
-        result = get_in_app_product("com.example.app", "premium")
-
-        mock_client.get_in_app_product.assert_called_once_with("com.example.app", "premium")
-        assert result["title"] == "Premium"
 
 
 # =========================================================================

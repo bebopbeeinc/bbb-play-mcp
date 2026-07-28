@@ -34,6 +34,22 @@ Complete reference for all MCP tools provided by the Play Store MCP server.
 | [`get_review`](tools/reviews.md#get_review) | Fetch a single review by ID |
 | [`reply_to_review`](tools/reviews.md#reply_to_review) | Reply to a user review |
 
+## Android Vitals Tools
+
+All read-only — the Play Developer Reporting API defines no write methods. Requires the app-level **View app quality information (read-only)** (`CAN_VIEW_APP_QUALITY`) permission *and* the Google Play Developer Reporting API enabled in the Cloud project; see [Android Vitals](tools/vitals.md#requirements).
+
+| Tool | Description |
+|---|---|
+| [`get_vitals_summary`](tools/vitals.md#get_vitals_summary) | Crash, ANR, and slow-start timelines over one shared window (3 queries) |
+| [`get_crash_rate`](tools/vitals.md#get_crash_rate) | Daily crash-rate timeline, optionally broken down by dimensions |
+| [`get_anr_rate`](tools/vitals.md#get_anr_rate) | Daily ANR-rate timeline, optionally broken down by dimensions |
+| [`get_slow_start_rate`](tools/vitals.md#get_slow_start_rate) | Daily slow-app-start rate; split cold/warm/hot with `startType` |
+| [`get_excessive_wakeup_rate`](tools/vitals.md#get_excessive_wakeup_rate) | Daily excessive-wakeup rate (battery drain) |
+| [`search_error_issues`](tools/vitals.md#search_error_issues) | Crash/ANR issues grouped by root cause — the "top crashes" view |
+| [`search_error_reports`](tools/vitals.md#search_error_reports) | Individual crash/ANR reports (stack traces) |
+| [`list_anomalies`](tools/vitals.md#list_anomalies) | Anomalies Play detected for the app |
+| [`get_metric_freshness`](tools/vitals.md#get_metric_freshness) | How current a metric set's data is |
+
 ## Subscription Tools
 
 | Tool | Description |
@@ -64,18 +80,15 @@ Complete reference for all MCP tools provided by the Play Store MCP server.
 | [`get_subscription_status`](tools/subscriptions.md#get_subscription_status) | Check subscription purchase status |
 | [`list_voided_purchases`](tools/subscriptions.md#list_voided_purchases) | List voided purchases |
 
-## In-App Products Tools
+## In-App Product Purchase Tools
+
+Catalog management moved to [One-Time Product Tools](#one-time-product-tools) —
+the `v3.inappproducts` resource is retired and the `*_in_app_product(s)` tools
+were removed. See the
+[migration table](tools/subscriptions.md#one-time-products).
 
 | Tool | Description |
 |---|---|
-| [`list_in_app_products`](tools/subscriptions.md#list_in_app_products) | List all in-app products |
-| [`get_in_app_product`](tools/subscriptions.md#get_in_app_product) | Get details of a specific product |
-| [`batch_get_in_app_products`](tools/subscriptions.md#batch_get_in_app_products) | Get details for multiple products at once |
-| `create_in_app_product` | Create a new in-app product (write) |
-| `update_in_app_product` | Update (replace) an in-app product (write) |
-| `patch_in_app_product` | Partially update an in-app product (write) |
-| `delete_in_app_product` | Delete an in-app product (write) |
-| `batch_delete_in_app_products` | Delete multiple in-app products at once (write) |
 | [`get_product_purchase`](tools/subscriptions.md#get_product_purchase) | Check status of an in-app product purchase |
 | [`acknowledge_product_purchase`](tools/subscriptions.md#acknowledge_product_purchase) | Acknowledge an in-app product purchase (write) |
 | [`consume_product_purchase`](tools/subscriptions.md#consume_product_purchase) | Consume an in-app product purchase (write) |
