@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -236,6 +237,74 @@ def test_query_metric_set_always_sends_timeline_with_a_period() -> None:
 
     spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
     assert spec["aggregationPeriod"] == "DAILY"
+
+
+def _timeline_bounds(service: MagicMock) -> tuple[date, date]:
+    """The (start, end) the client actually put on the wire, as dates."""
+    spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
+    return (
+        date(**{k: v for k, v in spec["startTime"].items() if k != "hours"}),
+        date(**{k: v for k, v in spec["endTime"].items() if k != "hours"}),
+    )
+
+
+def test_query_metric_set_default_window_anchors_on_a_supplied_end_date() -> None:
+    """A caller who gives only end_date gets a window ending there.
+
+    Regression: the default start was derived from the clock even when the
+    caller supplied end_date, so any historical end_date produced start > end --
+    an inverted range the API rejects.
+    """
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+        end_date="2026-06-01",
+    )
+
+    start, end = _timeline_bounds(service)
+    assert end == date(2026, 6, 1)
+    assert start == date(2026, 5, 5)
+    assert start < end
+
+
+def test_query_metric_set_default_window_ends_a_day_back() -> None:
+    """With neither bound given, the window ends yesterday -- today is still
+    aggregating, and the API rejects an end past the current freshness."""
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+    )
+
+    start, end = _timeline_bounds(service)
+    assert end == date.today() - timedelta(days=1)
+    assert (end - start).days == 27
+    assert start < end
+
+
+@pytest.mark.parametrize("end_date", ["2026-06-01", "2026-06-01T09", "2020-01-01"])
+def test_query_metric_set_never_builds_an_inverted_range(end_date: str) -> None:
+    """No supplied end_date, however old, may produce start > end."""
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+        end_date=end_date,
+        aggregation_period="HOURLY" if "T" in end_date else "DAILY",
+    )
+
+    start, end = _timeline_bounds(service)
+    assert start < end
 
 
 def test_query_metric_set_rejects_hour_on_daily_aggregation() -> None:

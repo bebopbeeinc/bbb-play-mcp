@@ -162,6 +162,11 @@ _REPORTING_DATE_FORMATS: tuple[tuple[str, bool], ...] = (
     ("%Y-%m-%d", False),
 )
 
+# Length of the window built when a caller supplies neither bound. The API
+# requires a start_date, so there is always a default to pick; this is the
+# number of daily points it asks for, inclusive of both ends.
+_REPORTING_DEFAULT_WINDOW_DAYS = 28
+
 
 class PlayStoreClientError(Exception):
     """Base exception for Play Store client errors."""
@@ -5938,12 +5943,26 @@ class PlayStoreClient:
         # gets a trailing 28-day daily window rather than a guaranteed 400.
         aggregation_period = aggregation_period or "DAILY"
         if start_date is None:
-            # End one day back: the API rejects an end_date beyond the current
-            # data freshness ("should be at most the current freshness"), and
-            # today is always still aggregating.
-            end = _dt.date.today() - _dt.timedelta(days=1)
-            start_date = (end - _dt.timedelta(days=27)).isoformat()
-            end_date = end_date or end.isoformat()
+            if end_date is not None:
+                # Anchor the trailing window on the bound the caller actually
+                # gave. Deriving it from the clock instead produced start > end
+                # for any historical end_date -- an inverted range, and the API
+                # rejects it. Reuse the shared parser so an unparseable end_date
+                # fails here with the same message it would have failed with below.
+                parsed = cls._reporting_datetime(end_date, "end_date")
+                anchor = _dt.date(parsed["year"], parsed["month"], parsed["day"])
+            else:
+                # Neither bound given. End one day back: the API rejects an
+                # end_date beyond the current data freshness ("should be at most
+                # the current freshness"), and today is always still aggregating.
+                # Callers that need the real ceiling should ask the metric set --
+                # freshness differs per metric set, so this is a safe floor, not
+                # a substitute for get_metric_set_freshness.
+                anchor = _dt.date.today() - _dt.timedelta(days=1)
+                end_date = anchor.isoformat()
+            start_date = (
+                anchor - _dt.timedelta(days=_REPORTING_DEFAULT_WINDOW_DAYS - 1)
+            ).isoformat()
 
         if aggregation_period:
             if aggregation_period not in _REPORTING_AGGREGATION_PERIODS:

@@ -13,9 +13,10 @@ import os
 import secrets
 import sys
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import uvicorn
@@ -25,6 +26,9 @@ from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 from play_store_mcp.client import (
     REPORTING_METRIC_SETS,
@@ -3420,10 +3424,109 @@ def _vitals_window(days: int) -> tuple[str, str]:
 
     The end bound is exclusive, so the window is the `days` complete days before
     today rather than a partial day of data that is still aggregating.
+
+    Only for the error-search and anomaly endpoints, which accept an end bound of
+    today. The metric-set `query` endpoint does NOT -- it enforces a per-metric-set
+    freshness ceiling and 400s above it -- so those callers must use
+    _metric_set_window instead. The two endpoints really do differ: measured live
+    on 2026-07-29, errorCountMetricSet was fresh to that same day 06:00 while
+    crashRate, anrRate, slowStart and excessiveWakeup all stopped at 2026-07-28.
     """
     end = datetime.now(UTC).date()
     start = end - timedelta(days=days)
     return start.isoformat(), end.isoformat()
+
+
+# Freshness moves at most hourly and every vitals tool needs it, so cache it
+# briefly rather than spending a quota call per query. get_vitals_summary alone
+# would otherwise cost three extra lookups.
+_FRESHNESS_TTL_SECONDS = 900
+_freshness_cache: dict[tuple[str, str], tuple[float, date | None]] = {}
+
+
+def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
+    """The newest end bound this metric set's DAILY timeline will accept.
+
+    Returns None when freshness cannot be determined -- an unknown metric set, a
+    permission error, or a response with no DAILY entry (not every metric set
+    publishes one for every aggregation period). Callers fall back to the clock;
+    a missing ceiling must not turn a working query into an error.
+    """
+    key = (package_name, metric_set)
+    cached = _freshness_cache.get(key)
+    now = monotonic()
+    if cached is not None and now - cached[0] < _FRESHNESS_TTL_SECONDS:
+        return cached[1]
+
+    result: date | None = None
+    try:
+        freshness = get_client_from_context().get_metric_set_freshness(
+            package_name=package_name, metric_set=metric_set
+        )
+        entries = freshness.get("freshnessInfo", {}).get("freshnesses", [])
+        for entry in entries:
+            if entry.get("aggregationPeriod") != VITALS_AGGREGATION_PERIOD:
+                continue
+            latest = entry.get("latestEndTime") or {}
+            # A DAILY latestEndTime may still carry an hours field (errorCount
+            # reports "day 29, hours 6"). The calendar date is the bound; the
+            # hour is how far into that day the aggregation has run.
+            if all(part in latest for part in ("year", "month", "day")):
+                result = date(latest["year"], latest["month"], latest["day"])
+            break
+    except Exception as exc:  # noqa: BLE001 - freshness is advisory, never fatal
+        logger.warning(
+            "Could not read metric set freshness; falling back to the clock",
+            package_name=package_name,
+            metric_set=metric_set,
+            error=str(exc),
+        )
+
+    _freshness_cache[key] = (now, result)
+    return result
+
+
+def _metric_set_window(
+    package_name: str, metric_sets: Sequence[str], days: int
+) -> tuple[str, str, str | None]:
+    """Trailing window of `days` ending at the latest data ALL of `metric_sets` have.
+
+    The metric-set query endpoint rejects an end bound past a metric set's
+    freshness ("'timeline_spec.end_date' field should be at most the current
+    freshness"), so anchoring on the clock 400s on every call -- which is exactly
+    what it did until this was measured against the live API. Freshness is
+    per-metric-set, so a request spanning several takes the oldest ceiling: one
+    window the whole response can be compared across, and no 400.
+
+    Returns (start_date, end_date, note) where note is set when the window had to
+    be pulled back from today, so the caller can say so rather than silently
+    answering a different question than the one asked.
+    """
+    ceilings = [
+        end for ms in metric_sets if (end := _latest_daily_end(package_name, ms)) is not None
+    ]
+
+    clock_end = datetime.now(UTC).date()
+    if ceilings:
+        end = min(ceilings)
+        note = None
+        if end < clock_end:
+            note = (
+                f"Window ends {end.isoformat()}, not today: that is the latest data "
+                f"{'these metric sets have' if len(metric_sets) > 1 else 'this metric set has'}. "
+                "Vitals lag real time by a day or more."
+            )
+    else:
+        # No ceiling readable. One day back is the safe floor -- today is always
+        # still aggregating -- and it is what the client's own default uses.
+        end = clock_end - timedelta(days=1)
+        note = (
+            "Could not read this metric set's freshness; using a window ending "
+            f"{end.isoformat()}. Call get_metric_freshness if the result looks short."
+        )
+
+    start = end - timedelta(days=days)
+    return start.isoformat(), end.isoformat(), note
 
 
 def _query_vitals(
@@ -3439,7 +3542,7 @@ def _query_vitals(
     query per dimension value, which matters because the API's default quota is
     around 10 QPS.
     """
-    start_date, end_date = _vitals_window(days)
+    start_date, end_date, window_note = _metric_set_window(package_name, [metric_set], days)
 
     client = get_client_from_context()
 
@@ -3453,7 +3556,7 @@ def _query_vitals(
         aggregation_period=VITALS_AGGREGATION_PERIOD,
     )
 
-    return {
+    result = {
         "package_name": package_name,
         "metric_set": metric_set,
         "metrics": metrics,
@@ -3463,6 +3566,9 @@ def _query_vitals(
         "days": days,
         "data": data,
     }
+    if window_note:
+        result["window_note"] = window_note
+    return result
 
 
 @mcp.tool()
@@ -3488,8 +3594,9 @@ def get_crash_rate(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["versionCode"], ["deviceModel"], ["apiLevel"], ["countryCode"]).
             Omit for an app-wide timeline.
@@ -3532,8 +3639,9 @@ def get_anr_rate(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["versionCode"], ["deviceModel"], ["apiLevel"], ["countryCode"]).
             Omit for an app-wide timeline.
@@ -3572,8 +3680,9 @@ def get_excessive_wakeup_rate(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["versionCode"], ["deviceModel"]). Omit for an app-wide timeline.
 
@@ -3612,8 +3721,9 @@ def get_slow_start_rate(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["startType"], ["versionCode"], ["deviceModel"]). Omit for a
             single app-wide timeline across all start types.
@@ -3669,8 +3779,9 @@ def get_vitals_summary(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
 
     Returns:
         The shared window plus crash_rate, anr_rate, and slow_start_rate timelines
@@ -3678,7 +3789,8 @@ def get_vitals_summary(
     if err := _validate_vitals_days(days):
         return {"error": err}
 
-    start_date, end_date = _vitals_window(days)
+    summary_metric_sets = ["crashRateMetricSet", "anrRateMetricSet", "slowStartRateMetricSet"]
+    start_date, end_date, window_note = _metric_set_window(package_name, summary_metric_sets, days)
 
     client = get_client_from_context()
 
@@ -3707,16 +3819,19 @@ def get_vitals_summary(
         aggregation_period=VITALS_AGGREGATION_PERIOD,
     )
 
-    return {
+    summary = {
         "package_name": package_name,
         "start_date": start_date,
         "end_date": end_date,
         "days": days,
-        "metric_sets": ["crashRateMetricSet", "anrRateMetricSet", "slowStartRateMetricSet"],
+        "metric_sets": summary_metric_sets,
         "crash_rate": crash_rate,
         "anr_rate": anr_rate,
         "slow_start_rate": slow_start_rate,
     }
+    if window_note:
+        summary["window_note"] = window_note
+    return summary
 
 
 @mcp.tool()

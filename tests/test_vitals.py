@@ -611,3 +611,197 @@ def test_single_metric_tools_make_one_round_trip(monkeypatch: pytest.MonkeyPatch
     assert _round_trips(service) == 1
     body = service.vitals.return_value.crashrate.return_value.query.call_args.kwargs["body"]
     assert body["dimensions"] == ["versionCode", "deviceModel", "countryCode"]
+
+
+# =========================================================================
+# Freshness-derived windows
+# =========================================================================
+
+
+def _freshness(latest: date, aggregation_period: str = "DAILY") -> dict[str, Any]:
+    """A freshnessInfo payload shaped like the live API's."""
+    return {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": aggregation_period,
+                    "latestEndTime": {
+                        "year": latest.year,
+                        "month": latest.month,
+                        "day": latest.day,
+                        "timeZone": {"id": "America/Los_Angeles"},
+                    },
+                }
+            ]
+        }
+    }
+
+
+class TestFreshnessDerivedWindow:
+    """The metric-set query endpoint 400s on an end bound past a metric set's
+    freshness, so the window is derived from the data rather than the clock.
+
+    Measured live on 2026-07-29: crashRate/anrRate/slowStart/excessiveWakeup were
+    fresh only to 07-28 while errorCount reached 07-29, so a single clock-derived
+    end bound cannot be right for all of them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        from play_store_mcp import server
+
+        server._freshness_cache.clear()
+        yield
+        server._freshness_cache.clear()
+
+    def test_window_ends_at_the_metric_sets_freshness(self, mock_client: MagicMock) -> None:
+        ceiling = datetime.now(UTC).date() - timedelta(days=3)
+        mock_client.get_metric_set_freshness.return_value = _freshness(ceiling)
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_crash_rate(PACKAGE, days=7)
+
+        assert result["end_date"] == ceiling.isoformat()
+        assert result["start_date"] == (ceiling - timedelta(days=7)).isoformat()
+        assert "window_note" in result
+        kwargs = mock_client.query_metric_set.call_args.kwargs
+        assert kwargs["end_date"] == ceiling.isoformat()
+
+    def test_no_note_when_data_is_current(self, mock_client: MagicMock) -> None:
+        """A window that already reaches today needs no explanation."""
+        mock_client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        assert "window_note" not in get_crash_rate(PACKAGE, days=7)
+
+    def test_summary_takes_the_oldest_ceiling_of_its_metric_sets(
+        self, mock_client: MagicMock
+    ) -> None:
+        """One shared window across three metric sets must clear the strictest
+        ceiling, or the whole call 400s on whichever set is furthest behind."""
+        today = datetime.now(UTC).date()
+        ceilings = {
+            "crashRateMetricSet": today - timedelta(days=1),
+            "anrRateMetricSet": today - timedelta(days=4),
+            "slowStartRateMetricSet": today - timedelta(days=2),
+        }
+        mock_client.get_metric_set_freshness.side_effect = lambda metric_set, **_: _freshness(
+            ceilings[metric_set]
+        )
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_vitals_summary(PACKAGE, days=7)
+
+        assert result["end_date"] == (today - timedelta(days=4)).isoformat()
+        ends = {c.kwargs["end_date"] for c in mock_client.query_metric_set.call_args_list}
+        assert ends == {result["end_date"]}
+
+    def test_falls_back_to_a_day_back_when_freshness_errors(self, mock_client: MagicMock) -> None:
+        """A freshness lookup that fails must not turn a working query into an error."""
+        mock_client.get_metric_set_freshness.side_effect = PlayStoreClientError("no permission")
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_crash_rate(PACKAGE, days=7)
+
+        assert result["end_date"] == (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+        assert "window_note" in result
+
+    def test_falls_back_when_no_daily_entry_is_published(self, mock_client: MagicMock) -> None:
+        """Not every metric set reports every aggregation period."""
+        mock_client.get_metric_set_freshness.return_value = _freshness(
+            datetime.now(UTC).date(), aggregation_period="HOURLY"
+        )
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_crash_rate(PACKAGE, days=7)
+
+        assert result["end_date"] == (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+
+    def test_freshness_is_cached_across_calls(self, mock_client: MagicMock) -> None:
+        """Freshness moves at most hourly; paying a quota call per query is waste."""
+        mock_client.get_metric_set_freshness.return_value = _freshness(
+            datetime.now(UTC).date() - timedelta(days=1)
+        )
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        get_crash_rate(PACKAGE, days=7)
+        get_crash_rate(PACKAGE, days=14)
+
+        assert mock_client.get_metric_set_freshness.call_count == 1
+
+
+# Verbatim freshnessInfo payloads recorded from the live Play Developer Reporting
+# API on 2026-07-29. Kept as fixtures because the shape carries three traps that
+# a hand-written mock would not reproduce: HOURLY can precede DAILY, a DAILY
+# entry may itself carry an `hours` field, and some metric sets publish no HOURLY
+# entry at all.
+LIVE_FRESHNESS: dict[str, dict[str, Any]] = {
+    "crashRateMetricSet": {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": "HOURLY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 11},
+                },
+                {
+                    "aggregationPeriod": "DAILY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 28},
+                },
+            ]
+        }
+    },
+    "slowStartRateMetricSet": {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": "DAILY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 28},
+                }
+            ]
+        }
+    },
+    "errorCountMetricSet": {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": "HOURLY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 13},
+                },
+                {
+                    "aggregationPeriod": "DAILY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 6},
+                },
+                {
+                    "aggregationPeriod": "FULL_RANGE",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 6},
+                },
+            ]
+        }
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("metric_set", "expected"),
+    [
+        ("crashRateMetricSet", date(2026, 7, 28)),
+        ("slowStartRateMetricSet", date(2026, 7, 28)),
+        # Fresher than the rate metric sets, and its DAILY entry carries an hour.
+        # The calendar date is the bound; the hour is how far into it aggregation ran.
+        ("errorCountMetricSet", date(2026, 7, 29)),
+    ],
+)
+def test_live_freshness_payloads_yield_the_ceiling_the_api_enforces(
+    mock_client: MagicMock, metric_set: str, expected: date
+) -> None:
+    """Recorded responses must produce the same bound the API named in its 400:
+    "'timeline_spec.end_date' field should be at most the current freshness
+    2026-07-28 00:00". Anchoring on the clock instead 400s on every call."""
+    from play_store_mcp import server
+
+    server._freshness_cache.clear()
+    mock_client.get_metric_set_freshness.return_value = LIVE_FRESHNESS[metric_set]
+
+    assert server._latest_daily_end(PACKAGE, metric_set) == expected
+
+    server._freshness_cache.clear()
