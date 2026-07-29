@@ -1003,3 +1003,25 @@ def test_error_search_rejects_a_bad_interval_bound() -> None:
 
     with pytest.raises(PlayStoreClientError, match="Invalid end_date"):
         _client(service).search_error_issues(PACKAGE, end_date="last tuesday")
+
+
+def test_query_metric_set_keeps_the_hour_when_deriving_an_hourly_start() -> None:
+    """An HOURLY end_date must not lose its hour to the default start.
+
+    Dropping it widened the window to 28 days plus that many hours, and the extra
+    rows can displace requested ones once max_results is in play.
+    """
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+        end_date="2026-06-01T09",
+        aggregation_period="HOURLY",
+    )
+
+    spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
+    assert spec["endTime"] == {"year": 2026, "month": 6, "day": 1, "hours": 9}
+    assert spec["startTime"] == {"year": 2026, "month": 5, "day": 4, "hours": 9}

@@ -1038,3 +1038,40 @@ class TestFreshnessClientAndConcurrency:
 
         assert not errors, f"{type(errors[0]).__name__}: {errors[0]}"
         assert len(server._freshness_cache) <= server._FRESHNESS_CACHE_MAX
+
+
+def test_a_failed_lookup_never_overwrites_a_concurrent_success() -> None:
+    """Two workers can miss the same key and both fetch outside the lock. If one
+    succeeds and the other fails, the failure must not win by finishing last --
+    that discards a just-fetched ceiling and pins the next 60s to the fallback.
+
+    The interleaving is forced rather than hoped for: the losing lookup completes
+    the winning one from inside its own network call, then raises. Calling them
+    in sequence would not exercise this at all -- the second would simply read
+    the warm cache and never reach the write path.
+    """
+    from play_store_mcp import server
+
+    server._freshness_cache.clear()
+    ceiling = datetime.now(UTC).date() - timedelta(days=3)
+
+    winner = MagicMock()
+    winner.credentials_fingerprint = "acct"
+    winner.get_metric_set_freshness.return_value = _freshness(ceiling)
+
+    loser = MagicMock()
+    loser.credentials_fingerprint = "acct"
+
+    def _winner_lands_then_fail(**_: Any) -> dict[str, Any]:
+        server._latest_daily_end(winner, PACKAGE, "crashRateMetricSet")
+        raise PlayStoreClientError("429 rate limited")
+
+    loser.get_metric_set_freshness.side_effect = _winner_lands_then_fail
+
+    # The loser misses the cache, and the winner's success lands mid-flight.
+    assert server._latest_daily_end(loser, PACKAGE, "crashRateMetricSet") == ceiling
+
+    (_, value, ttl) = next(iter(server._freshness_cache.values()))
+    assert value == ceiling
+    assert ttl == server._FRESHNESS_TTL_SECONDS
+    server._freshness_cache.clear()

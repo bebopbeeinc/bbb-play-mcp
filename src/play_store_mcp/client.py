@@ -5973,6 +5973,10 @@ class PlayStoreClient:
                 # fails here with the same message it would have failed with below.
                 parsed = cls._reporting_datetime(end_date, "end_date")
                 anchor = _dt.date(parsed["year"], parsed["month"], parsed["day"])
+                # Keep the hour for an HOURLY bound. Dropping it silently widened
+                # the window to 28 days plus that many hours, and those extra rows
+                # can displace requested ones once max_results is in play.
+                anchor_hour = parsed.get("hours")
             else:
                 # Neither bound given. End one day back: the API rejects an
                 # end_date beyond the current data freshness ("should be at most
@@ -5982,11 +5986,14 @@ class PlayStoreClient:
                 # a substitute for get_metric_set_freshness.
                 anchor = _dt.date.today() - _dt.timedelta(days=1)
                 end_date = anchor.isoformat()
+                anchor_hour = None
             # endTime is exclusive, so N daily points span N days, not N-1. The
             # old -27 yielded 27 points for a window documented as 28, and it
             # disagreed with the server-side helper, which already subtracted the
             # full span. One semantics, stated once, used by both paths.
             start_date = (anchor - _dt.timedelta(days=_REPORTING_DEFAULT_WINDOW_DAYS)).isoformat()
+            if anchor_hour is not None:
+                start_date = f"{start_date}T{anchor_hour:02d}"
 
         if aggregation_period:
             if aggregation_period not in _REPORTING_AGGREGATION_PERIODS:

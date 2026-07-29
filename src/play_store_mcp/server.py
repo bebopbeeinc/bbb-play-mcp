@@ -3537,6 +3537,15 @@ def _latest_daily_end(client: PlayStoreClient, package_name: str, metric_set: st
 
     with _freshness_lock:
         _prune_freshness_cache(now)
+        if result is None:
+            # Two workers can miss the same key and both fetch outside the lock.
+            # If one succeeded while this one failed, the success is the better
+            # answer and must not be overwritten by a failure that happened to
+            # finish last -- that would discard a just-fetched ceiling and pin
+            # the next 60s to the fallback bound.
+            existing = _freshness_cache.get(key)
+            if existing is not None and existing[1] is not None and now - existing[0] < existing[2]:
+                return existing[1]
         _freshness_cache[key] = (now, result, ttl)
     return result
 
@@ -3657,10 +3666,13 @@ def get_crash_rate(
     1.09% bad-behavior threshold applies to), and distinctUsers, the denominator
     those rates are computed over. Rates are fractions: 0.0109 means 1.09%.
 
-    Costs a single Reporting API query. Vitals lag real time, so an empty tail
-    (or an empty result with a `note`) usually means the window ran past the
-    latest available data — get_metric_freshness("crashRateMetricSet") reports
-    how current the metric set is.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
+
+    Vitals lag real time, so an empty tail (or an empty result with a `note`)
+    usually means the window ran past the latest available data —
+    get_metric_freshness("crashRateMetricSet") reports how current it is.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
@@ -3702,10 +3714,13 @@ def get_anr_rate(
     applies to), and distinctUsers, the denominator. Rates are fractions:
     0.0047 means 0.47%.
 
-    Costs a single Reporting API query. Vitals lag real time, so an empty tail
-    (or an empty result with a `note`) usually means the window ran past the
-    latest available data — get_metric_freshness("anrRateMetricSet") reports how
-    current the metric set is.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
+
+    Vitals lag real time, so an empty tail (or an empty result with a `note`)
+    usually means the window ran past the latest available data —
+    get_metric_freshness("anrRateMetricSet") reports how current it is.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
@@ -3746,7 +3761,9 @@ def get_excessive_wakeup_rate(
     woke more than 10 times per hour — the Android vitals signal for alarm and
     JobScheduler abuse draining battery. distinctUsers is the denominator.
 
-    Costs a single Reporting API query.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
@@ -3787,7 +3804,9 @@ def get_slow_start_rate(
     Pass dimensions=["startType"] to split COLD/WARM/HOT within the same single
     query — cold start is usually the one worth acting on.
 
-    Costs a single Reporting API query.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
@@ -3836,9 +3855,12 @@ def get_vitals_summary(
     All rates are fractions (0.0109 = 1.09%) over distinctUsers, which each
     timeline also reports.
 
-    Cost: exactly three Reporting API queries, one per metric set, with no
-    dimension breakdown. The API's default quota is around 10 QPS, so this
-    deliberately does not fan out per version, device, or country — call
+    Cost: three Reporting API queries, one per metric set, with no dimension
+    breakdown — plus one freshness lookup per metric set when their ceilings are
+    not already cached, so six requests cold and three warm. The cold cost is
+    paid once per package per 15-minute TTL. The API's default quota is around
+    10 QPS, so this deliberately does not fan out per version, device, or
+    country — call
     get_crash_rate, get_anr_rate, or get_slow_start_rate with an explicit
     `dimensions` list when a breakdown is actually needed. Excessive wakeups
     have their own tool (get_excessive_wakeup_rate) and are not queried here.
