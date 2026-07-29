@@ -10,6 +10,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 from play_store_mcp.client import (
+    _REPORTING_DEFAULT_WINDOW_DAYS,
     REPORTING_API_NAME,
     REPORTING_API_VERSION,
     REPORTING_METRIC_SETS,
@@ -267,7 +268,7 @@ def test_query_metric_set_default_window_anchors_on_a_supplied_end_date() -> Non
 
     start, end = _timeline_bounds(service)
     assert end == date(2026, 6, 1)
-    assert start == date(2026, 5, 5)
+    assert start == date(2026, 5, 4)
     assert start < end
 
 
@@ -285,7 +286,7 @@ def test_query_metric_set_default_window_ends_a_day_back() -> None:
 
     start, end = _timeline_bounds(service)
     assert end == date.today() - timedelta(days=1)
-    assert (end - start).days == 27
+    assert (end - start).days == _REPORTING_DEFAULT_WINDOW_DAYS
     assert start < end
 
 

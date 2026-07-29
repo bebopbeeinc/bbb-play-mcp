@@ -558,10 +558,17 @@ def test_vitals_summary_makes_exactly_three_round_trips(
 ) -> None:
     """The quota property, pinned end to end rather than at the mock client.
 
-    The Reporting API allows roughly 10 QPS. Counting at the transport catches
-    a regression the call-count test cannot: a summary that still made three
-    ``query_metric_set`` calls but paged, probed freshness, or fanned out
-    underneath would show up here as more than three requests.
+    The Reporting API allows roughly 10 QPS. Counting at the transport catches a
+    regression the call-count test cannot: a summary that still made three
+    ``query_metric_set`` calls but paged or fanned out underneath would show up
+    here as more than three requests.
+
+    Freshness probing is the one addition this budget deliberately allows, and
+    only on a cold cache. It was previously counted as a regression -- but the
+    three round trips it was protecting were three *failures*: the clock-derived
+    end bound exceeded the metric sets' freshness ceiling and every query 400'd.
+    Six requests that answer beat three that cannot. The cache keeps the steady
+    state at three, so the extra cost is paid once per package per TTL.
     """
     service = MagicMock()
     vitals = service.vitals.return_value
@@ -571,12 +578,20 @@ def test_vitals_summary_makes_exactly_three_round_trips(
 
     from play_store_mcp import server
 
+    server._freshness_cache.clear()
     client = _reporting_client(service)
     monkeypatch.setattr(server, "get_client_from_context", lambda: client)
 
     result = get_vitals_summary(PACKAGE)
 
-    assert _round_trips(service) == 3
+    # Cold: one freshness lookup per metric set, then the three queries.
+    assert _round_trips(service) == 6
+
+    # Warm: freshness is cached, so the steady state is the original budget.
+    before = _round_trips(service)
+    get_vitals_summary(PACKAGE)
+    assert _round_trips(service) - before == 3
+    server._freshness_cache.clear()
     assert result["crash_rate"]["rows"] == [{"c": 1}]
     assert result["anr_rate"]["rows"] == [{"a": 1}]
     assert result["slow_start_rate"]["rows"] == [{"s": 1}]
@@ -596,7 +611,12 @@ def test_vitals_summary_makes_exactly_three_round_trips(
 
 
 def test_single_metric_tools_make_one_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A dimension breakdown is one query with dimensions, not a query per value."""
+    """A dimension breakdown is one query with dimensions, not a query per value.
+
+    Cold, that is one freshness lookup plus the query; warm, the query alone. The
+    property being pinned is that dimensions do not fan out -- three dimensions
+    still cost one query, not one per dimension value.
+    """
     service = MagicMock()
     service.vitals.return_value.crashrate.return_value.query.return_value.execute.return_value = {
         "rows": [{"c": 1}]
@@ -604,11 +624,18 @@ def test_single_metric_tools_make_one_round_trip(monkeypatch: pytest.MonkeyPatch
 
     from play_store_mcp import server
 
+    server._freshness_cache.clear()
     monkeypatch.setattr(server, "get_client_from_context", lambda: _reporting_client(service))
 
     get_crash_rate(PACKAGE, dimensions=["versionCode", "deviceModel", "countryCode"])
 
-    assert _round_trips(service) == 1
+    assert _round_trips(service) == 2
+
+    before = _round_trips(service)
+    get_crash_rate(PACKAGE, dimensions=["versionCode", "deviceModel", "countryCode"])
+    assert _round_trips(service) - before == 1
+
+    server._freshness_cache.clear()
     body = service.vitals.return_value.crashrate.return_value.query.call_args.kwargs["body"]
     assert body["dimensions"] == ["versionCode", "deviceModel", "countryCode"]
 
@@ -805,3 +832,108 @@ def test_live_freshness_payloads_yield_the_ceiling_the_api_enforces(
     assert server._latest_daily_end(PACKAGE, metric_set) == expected
 
     server._freshness_cache.clear()
+
+
+class TestFreshnessCacheHygiene:
+    """Properties of the cache itself, all three raised in review."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        from play_store_mcp import server
+
+        server._freshness_cache.clear()
+        yield
+        server._freshness_cache.clear()
+
+    def test_cache_is_scoped_to_the_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Credentials arrive per request, so one account's failure must not be
+        served to another. Without the credential term in the key, an account
+        without the app-quality permission caches None and an authorized account
+        silently inherits the fallback -- and the 400 this module exists to avoid."""
+        from play_store_mcp import server
+
+        denied = MagicMock()
+        denied.credentials_fingerprint = "acct-denied"
+        denied.get_metric_set_freshness.side_effect = PlayStoreClientError("no permission")
+
+        allowed = MagicMock()
+        allowed.credentials_fingerprint = "acct-allowed"
+        ceiling = datetime.now(UTC).date() - timedelta(days=3)
+        allowed.get_metric_set_freshness.return_value = _freshness(ceiling)
+
+        monkeypatch.setattr(server, "get_client_from_context", lambda: denied)
+        assert server._latest_daily_end(PACKAGE, "crashRateMetricSet") is None
+
+        monkeypatch.setattr(server, "get_client_from_context", lambda: allowed)
+        assert server._latest_daily_end(PACKAGE, "crashRateMetricSet") == ceiling
+        allowed.get_metric_set_freshness.assert_called_once()
+
+    def test_expired_entries_are_evicted_not_merely_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A TTL checked only on read leaves every key resident forever, and
+        package_name is caller-supplied."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
+        monkeypatch.setattr(server, "get_client_from_context", lambda: client)
+
+        server._latest_daily_end("com.old.app", "crashRateMetricSet")
+        assert len(server._freshness_cache) == 1
+
+        # Age the existing entry past the TTL, then touch a different key.
+        stale_key = next(iter(server._freshness_cache))
+        stamp, value = server._freshness_cache[stale_key]
+        server._freshness_cache[stale_key] = (stamp - server._FRESHNESS_TTL_SECONDS - 1, value)
+
+        server._latest_daily_end("com.new.app", "crashRateMetricSet")
+
+        assert stale_key not in server._freshness_cache
+        assert len(server._freshness_cache) == 1
+
+    def test_cache_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Distinct packages arriving faster than the TTL still cannot grow forever."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
+        monkeypatch.setattr(server, "get_client_from_context", lambda: client)
+
+        for i in range(server._FRESHNESS_CACHE_MAX + 25):
+            server._latest_daily_end(f"com.example.app{i}", "crashRateMetricSet")
+
+        assert len(server._freshness_cache) <= server._FRESHNESS_CACHE_MAX
+
+    def test_summary_does_not_claim_a_window_it_could_not_verify(
+        self, mock_client: MagicMock
+    ) -> None:
+        """If one of the three ceilings is unreadable, the minimum of the other
+        two is not known to be safe for it -- it may lag further. Clamp to the
+        conservative floor and say the window is unverified."""
+
+        today = datetime.now(UTC).date()
+        # Both readable ceilings are NEWER than the conservative floor, so
+        # min(known) and min(known + floor) differ. Anything less and this test
+        # passes against the bug it exists to catch.
+        known = {
+            "crashRateMetricSet": today,
+            "anrRateMetricSet": today,
+        }
+
+        def _freshness_or_fail(metric_set: str, **_: Any) -> dict[str, Any]:
+            if metric_set not in known:
+                raise PlayStoreClientError("no permission")
+            return _freshness(known[metric_set])
+
+        mock_client.credentials_fingerprint = "acct"
+        mock_client.get_metric_set_freshness.side_effect = _freshness_or_fail
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_vitals_summary(PACKAGE, days=7)
+
+        assert result["end_date"] == (today - timedelta(days=1)).isoformat()
+        assert "slowStartRateMetricSet" in result["window_note"]
+        assert "unverified" in result["window_note"] or "conservative" in result["window_note"]

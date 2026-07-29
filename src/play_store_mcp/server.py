@@ -3441,7 +3441,30 @@ def _vitals_window(days: int) -> tuple[str, str]:
 # briefly rather than spending a quota call per query. get_vitals_summary alone
 # would otherwise cost three extra lookups.
 _FRESHNESS_TTL_SECONDS = 900
-_freshness_cache: dict[tuple[str, str], tuple[float, date | None]] = {}
+
+# Hard ceiling on cache size. Expired entries are evicted on write, but a server
+# taking requests for many distinct packages faster than the TTL expires them
+# would still grow without one -- and package_name is caller-supplied, so the key
+# space is not ours to bound.
+_FRESHNESS_CACHE_MAX = 512
+
+# Keyed on (credentials fingerprint, package, metric set). The credential term is
+# load-bearing: per-request X-Google-Credentials headers mean two callers can ask
+# about the same package with different service accounts. Without it, an account
+# lacking the app-quality permission caches its failure as None and an authorized
+# account served that entry silently falls back to the clock -- reintroducing the
+# very 400 this module exists to avoid.
+_freshness_cache: dict[tuple[str, str, str], tuple[float, date | None]] = {}
+
+
+def _prune_freshness_cache(now: float) -> None:
+    """Drop expired entries, then the oldest if still over the cap."""
+    for key in [
+        k for k, (stamp, _) in _freshness_cache.items() if now - stamp >= _FRESHNESS_TTL_SECONDS
+    ]:
+        del _freshness_cache[key]
+    while len(_freshness_cache) >= _FRESHNESS_CACHE_MAX:
+        del _freshness_cache[min(_freshness_cache, key=lambda k: _freshness_cache[k][0])]
 
 
 def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
@@ -3452,7 +3475,8 @@ def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
     publishes one for every aggregation period). Callers fall back to the clock;
     a missing ceiling must not turn a working query into an error.
     """
-    key = (package_name, metric_set)
+    client = get_client_from_context()
+    key = (client.credentials_fingerprint, package_name, metric_set)
     cached = _freshness_cache.get(key)
     now = monotonic()
     if cached is not None and now - cached[0] < _FRESHNESS_TTL_SECONDS:
@@ -3460,7 +3484,7 @@ def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
 
     result: date | None = None
     try:
-        freshness = get_client_from_context().get_metric_set_freshness(
+        freshness = client.get_metric_set_freshness(
             package_name=package_name, metric_set=metric_set
         )
         entries = freshness.get("freshnessInfo", {}).get("freshnesses", [])
@@ -3482,6 +3506,7 @@ def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
             error=str(exc),
         )
 
+    _prune_freshness_cache(now)
     _freshness_cache[key] = (now, result)
     return result
 
@@ -3496,33 +3521,49 @@ def _metric_set_window(
     freshness"), so anchoring on the clock 400s on every call -- which is exactly
     what it did until this was measured against the live API. Freshness is
     per-metric-set, so a request spanning several takes the oldest ceiling: one
-    window the whole response can be compared across, and no 400.
+    window the whole response can be compared across.
+
+    That guarantee only holds when EVERY ceiling was readable. If one lookup
+    fails, the minimum of the rest is not necessarily safe for the one that
+    failed -- it may lag further, and its query would still 400. In that case the
+    window is clamped to the strictest bound available and the note says which
+    metric sets were unverified, rather than claiming a guarantee that was not
+    established.
 
     Returns (start_date, end_date, note) where note is set when the window had to
     be pulled back from today, so the caller can say so rather than silently
     answering a different question than the one asked.
     """
-    ceilings = [
-        end for ms in metric_sets if (end := _latest_daily_end(package_name, ms)) is not None
-    ]
+    ceilings: list[date] = []
+    unverified: list[str] = []
+    for metric_set in metric_sets:
+        ceiling = _latest_daily_end(package_name, metric_set)
+        if ceiling is None:
+            unverified.append(metric_set)
+        else:
+            ceilings.append(ceiling)
 
     clock_end = datetime.now(UTC).date()
-    if ceilings:
-        end = min(ceilings)
-        note = None
-        if end < clock_end:
-            note = (
-                f"Window ends {end.isoformat()}, not today: that is the latest data "
-                f"{'these metric sets have' if len(metric_sets) > 1 else 'this metric set has'}. "
-                "Vitals lag real time by a day or more."
-            )
-    else:
-        # No ceiling readable. One day back is the safe floor -- today is always
-        # still aggregating -- and it is what the client's own default uses.
-        end = clock_end - timedelta(days=1)
+    # One day back is the safe floor -- today is always still aggregating -- and
+    # it is what the client's own default uses.
+    floor = clock_end - timedelta(days=1)
+    # Anything unverified drags the bound down to the floor: it is the most
+    # conservative end we can justify without having read that metric set.
+    end = min([*ceilings, floor]) if unverified else min(ceilings) if ceilings else floor
+
+    note = None
+    if unverified:
         note = (
-            "Could not read this metric set's freshness; using a window ending "
-            f"{end.isoformat()}. Call get_metric_freshness if the result looks short."
+            f"Window ends {end.isoformat()}. Freshness could not be read for "
+            f"{', '.join(unverified)}, so this window is the most conservative bound "
+            "available rather than a verified one; that metric set may still lag "
+            "further. Call get_metric_freshness to check."
+        )
+    elif end < clock_end:
+        note = (
+            f"Window ends {end.isoformat()}, not today: that is the latest data "
+            f"{'these metric sets have' if len(metric_sets) > 1 else 'this metric set has'}. "
+            "Vitals lag real time by a day or more."
         )
 
     start = end - timedelta(days=days)
