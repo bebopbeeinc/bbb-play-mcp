@@ -827,9 +827,10 @@ def test_live_freshness_payloads_yield_the_ceiling_the_api_enforces(
     from play_store_mcp import server
 
     server._freshness_cache.clear()
+    mock_client.credentials_fingerprint = "acct"
     mock_client.get_metric_set_freshness.return_value = LIVE_FRESHNESS[metric_set]
 
-    assert server._latest_daily_end(PACKAGE, metric_set) == expected
+    assert server._latest_daily_end(mock_client, PACKAGE, metric_set) == expected
 
     server._freshness_cache.clear()
 
@@ -845,7 +846,7 @@ class TestFreshnessCacheHygiene:
         yield
         server._freshness_cache.clear()
 
-    def test_cache_is_scoped_to_the_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_cache_is_scoped_to_the_credentials(self) -> None:
         """Credentials arrive per request, so one account's failure must not be
         served to another. Without the credential term in the key, an account
         without the app-quality permission caches None and an authorized account
@@ -861,16 +862,11 @@ class TestFreshnessCacheHygiene:
         ceiling = datetime.now(UTC).date() - timedelta(days=3)
         allowed.get_metric_set_freshness.return_value = _freshness(ceiling)
 
-        monkeypatch.setattr(server, "get_client_from_context", lambda: denied)
-        assert server._latest_daily_end(PACKAGE, "crashRateMetricSet") is None
-
-        monkeypatch.setattr(server, "get_client_from_context", lambda: allowed)
-        assert server._latest_daily_end(PACKAGE, "crashRateMetricSet") == ceiling
+        assert server._latest_daily_end(denied, PACKAGE, "crashRateMetricSet") is None
+        assert server._latest_daily_end(allowed, PACKAGE, "crashRateMetricSet") == ceiling
         allowed.get_metric_set_freshness.assert_called_once()
 
-    def test_expired_entries_are_evicted_not_merely_ignored(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_expired_entries_are_evicted_not_merely_ignored(self) -> None:
         """A TTL checked only on read leaves every key resident forever, and
         package_name is caller-supplied."""
         from play_store_mcp import server
@@ -878,32 +874,30 @@ class TestFreshnessCacheHygiene:
         client = MagicMock()
         client.credentials_fingerprint = "acct"
         client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
-        monkeypatch.setattr(server, "get_client_from_context", lambda: client)
 
-        server._latest_daily_end("com.old.app", "crashRateMetricSet")
+        server._latest_daily_end(client, "com.old.app", "crashRateMetricSet")
         assert len(server._freshness_cache) == 1
 
         # Age the existing entry past the TTL, then touch a different key.
         stale_key = next(iter(server._freshness_cache))
-        stamp, value = server._freshness_cache[stale_key]
-        server._freshness_cache[stale_key] = (stamp - server._FRESHNESS_TTL_SECONDS - 1, value)
+        stamp, value, ttl = server._freshness_cache[stale_key]
+        server._freshness_cache[stale_key] = (stamp - ttl - 1, value, ttl)
 
-        server._latest_daily_end("com.new.app", "crashRateMetricSet")
+        server._latest_daily_end(client, "com.new.app", "crashRateMetricSet")
 
         assert stale_key not in server._freshness_cache
         assert len(server._freshness_cache) == 1
 
-    def test_cache_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_cache_is_capped(self) -> None:
         """Distinct packages arriving faster than the TTL still cannot grow forever."""
         from play_store_mcp import server
 
         client = MagicMock()
         client.credentials_fingerprint = "acct"
         client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
-        monkeypatch.setattr(server, "get_client_from_context", lambda: client)
 
         for i in range(server._FRESHNESS_CACHE_MAX + 25):
-            server._latest_daily_end(f"com.example.app{i}", "crashRateMetricSet")
+            server._latest_daily_end(client, f"com.example.app{i}", "crashRateMetricSet")
 
         assert len(server._freshness_cache) <= server._FRESHNESS_CACHE_MAX
 
@@ -937,3 +931,110 @@ class TestFreshnessCacheHygiene:
         assert result["end_date"] == (today - timedelta(days=1)).isoformat()
         assert "slowStartRateMetricSet" in result["window_note"]
         assert "unverified" in result["window_note"] or "conservative" in result["window_note"]
+
+
+class TestFreshnessClientAndConcurrency:
+    """The second review round: client reuse, transient failures, and races."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        from play_store_mcp import server
+
+        server._freshness_cache.clear()
+        yield
+        server._freshness_cache.clear()
+
+    def _client(self, ceiling: date | None = None) -> MagicMock:
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(
+            ceiling or datetime.now(UTC).date()
+        )
+        client.query_metric_set.return_value = {"rows": []}
+        return client
+
+    def test_one_client_serves_freshness_and_queries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With per-request credentials each resolve builds a PlayStoreClient that
+        reloads credentials and refetches discovery, so a cold summary asking for
+        its own would construct four."""
+        from play_store_mcp import server
+
+        client = self._client()
+        calls = {"n": 0}
+
+        def _resolve() -> MagicMock:
+            calls["n"] += 1
+            return client
+
+        monkeypatch.setattr(server, "get_client_from_context", _resolve)
+
+        get_vitals_summary(PACKAGE, days=7)
+        assert calls["n"] == 1
+
+        calls["n"] = 0
+        get_crash_rate(PACKAGE, days=7)
+        assert calls["n"] == 1
+
+    def test_transient_failures_get_a_short_lifetime(self) -> None:
+        """A 429 or a dropped connection is not evidence that this metric set has
+        no ceiling. Caching it for the full TTL pins a quarter hour of queries to
+        the fallback bound -- and keeps 400ing anything lagging further."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.side_effect = PlayStoreClientError("429 rate limited")
+
+        assert server._latest_daily_end(client, PACKAGE, "crashRateMetricSet") is None
+
+        (_, value, ttl) = next(iter(server._freshness_cache.values()))
+        assert value is None
+        assert ttl == server._FRESHNESS_FAILURE_TTL_SECONDS
+        assert ttl < server._FRESHNESS_TTL_SECONDS
+
+    def test_a_valid_response_without_a_daily_entry_keeps_the_full_lifetime(self) -> None:
+        """That one is a durable fact about the metric set, not a transient error."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(
+            datetime.now(UTC).date(), aggregation_period="HOURLY"
+        )
+
+        assert server._latest_daily_end(client, PACKAGE, "crashRateMetricSet") is None
+
+        (_, value, ttl) = next(iter(server._freshness_cache.values()))
+        assert value is None
+        assert ttl == server._FRESHNESS_TTL_SECONDS
+
+    def test_concurrent_lookups_do_not_corrupt_the_cache(self) -> None:
+        """The tools are sync callables, so HTTP transports run them in a worker
+        pool. Unsynchronised, pruning iterates a dict another worker is inserting
+        into: "dictionary changed size during iteration"."""
+        import threading
+
+        from play_store_mcp import server
+
+        client = self._client()
+        errors: list[BaseException] = []
+        start = threading.Barrier(8)
+
+        def hammer(worker: int) -> None:
+            try:
+                start.wait()
+                for i in range(150):
+                    server._latest_daily_end(
+                        client, f"com.example.w{worker}.app{i}", "crashRateMetricSet"
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(w,)) for w in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors, f"{type(errors[0]).__name__}: {errors[0]}"
+        assert len(server._freshness_cache) <= server._FRESHNESS_CACHE_MAX

@@ -15,6 +15,7 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
@@ -3448,41 +3449,68 @@ _FRESHNESS_TTL_SECONDS = 900
 # space is not ours to bound.
 _FRESHNESS_CACHE_MAX = 512
 
+# A lookup that threw tells us nothing durable -- a 429, a 5xx or a dropped
+# connection is not evidence that this metric set has no ceiling. Caching that
+# for the full TTL would pin an entire quarter hour of queries to the fallback
+# bound, and for a metric set lagging more than a day those queries keep 400ing
+# for the whole window. Remember the failure just long enough not to hammer.
+_FRESHNESS_FAILURE_TTL_SECONDS = 60
+
 # Keyed on (credentials fingerprint, package, metric set). The credential term is
 # load-bearing: per-request X-Google-Credentials headers mean two callers can ask
 # about the same package with different service accounts. Without it, an account
 # lacking the app-quality permission caches its failure as None and an authorized
 # account served that entry silently falls back to the clock -- reintroducing the
 # very 400 this module exists to avoid.
-_freshness_cache: dict[tuple[str, str, str], tuple[float, date | None]] = {}
+#
+# Value is (stamp, ceiling, ttl): entries expire on their own schedule so a
+# transient failure does not get a successful lookup's lifetime.
+_freshness_cache: dict[tuple[str, str, str], tuple[float, date | None, float]] = {}
+
+# The tools are sync callables, so the HTTP transports run them in a worker
+# thread pool and several can touch this dict at once. Without the lock, pruning
+# iterates a dict another worker is inserting into -- "dictionary changed size
+# during iteration" -- and two workers can delete the same key. Held only around
+# the dict operations, never across the network call: serialising every freshness
+# lookup behind one lock would be worse than the duplicate fetch it prevents.
+_freshness_lock = Lock()
 
 
 def _prune_freshness_cache(now: float) -> None:
-    """Drop expired entries, then the oldest if still over the cap."""
-    for key in [
-        k for k, (stamp, _) in _freshness_cache.items() if now - stamp >= _FRESHNESS_TTL_SECONDS
-    ]:
+    """Drop expired entries, then the oldest if still over the cap.
+
+    Caller must hold ``_freshness_lock``.
+    """
+    for key in [k for k, (stamp, _, ttl) in _freshness_cache.items() if now - stamp >= ttl]:
         del _freshness_cache[key]
     while len(_freshness_cache) >= _FRESHNESS_CACHE_MAX:
         del _freshness_cache[min(_freshness_cache, key=lambda k: _freshness_cache[k][0])]
 
 
-def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
+def _latest_daily_end(client: PlayStoreClient, package_name: str, metric_set: str) -> date | None:
     """The newest end bound this metric set's DAILY timeline will accept.
+
+    Takes the caller's client rather than resolving its own: with per-request
+    credentials every ``get_client_from_context()`` builds a fresh
+    ``PlayStoreClient``, and each one reloads credentials and refetches API
+    discovery. A cold summary asking for its own would construct four.
 
     Returns None when freshness cannot be determined -- an unknown metric set, a
     permission error, or a response with no DAILY entry (not every metric set
     publishes one for every aggregation period). Callers fall back to the clock;
     a missing ceiling must not turn a working query into an error.
     """
-    client = get_client_from_context()
     key = (client.credentials_fingerprint, package_name, metric_set)
-    cached = _freshness_cache.get(key)
     now = monotonic()
-    if cached is not None and now - cached[0] < _FRESHNESS_TTL_SECONDS:
-        return cached[1]
+    with _freshness_lock:
+        cached = _freshness_cache.get(key)
+        if cached is not None and now - cached[0] < cached[2]:
+            return cached[1]
 
     result: date | None = None
+    # A well-formed response with no DAILY entry is a durable fact about this
+    # metric set; an exception is not. They get different lifetimes.
+    ttl = _FRESHNESS_TTL_SECONDS
     try:
         freshness = client.get_metric_set_freshness(
             package_name=package_name, metric_set=metric_set
@@ -3499,6 +3527,7 @@ def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
                 result = date(latest["year"], latest["month"], latest["day"])
             break
     except Exception as exc:  # noqa: BLE001 - freshness is advisory, never fatal
+        ttl = _FRESHNESS_FAILURE_TTL_SECONDS
         logger.warning(
             "Could not read metric set freshness; falling back to the clock",
             package_name=package_name,
@@ -3506,13 +3535,14 @@ def _latest_daily_end(package_name: str, metric_set: str) -> date | None:
             error=str(exc),
         )
 
-    _prune_freshness_cache(now)
-    _freshness_cache[key] = (now, result)
+    with _freshness_lock:
+        _prune_freshness_cache(now)
+        _freshness_cache[key] = (now, result, ttl)
     return result
 
 
 def _metric_set_window(
-    package_name: str, metric_sets: Sequence[str], days: int
+    client: PlayStoreClient, package_name: str, metric_sets: Sequence[str], days: int
 ) -> tuple[str, str, str | None]:
     """Trailing window of `days` ending at the latest data ALL of `metric_sets` have.
 
@@ -3537,7 +3567,7 @@ def _metric_set_window(
     ceilings: list[date] = []
     unverified: list[str] = []
     for metric_set in metric_sets:
-        ceiling = _latest_daily_end(package_name, metric_set)
+        ceiling = _latest_daily_end(client, package_name, metric_set)
         if ceiling is None:
             unverified.append(metric_set)
         else:
@@ -3583,9 +3613,8 @@ def _query_vitals(
     query per dimension value, which matters because the API's default quota is
     around 10 QPS.
     """
-    start_date, end_date, window_note = _metric_set_window(package_name, [metric_set], days)
-
     client = get_client_from_context()
+    start_date, end_date, window_note = _metric_set_window(client, package_name, [metric_set], days)
 
     data = client.query_metric_set(
         package_name=package_name,
@@ -3831,9 +3860,10 @@ def get_vitals_summary(
         return {"error": err}
 
     summary_metric_sets = ["crashRateMetricSet", "anrRateMetricSet", "slowStartRateMetricSet"]
-    start_date, end_date, window_note = _metric_set_window(package_name, summary_metric_sets, days)
-
     client = get_client_from_context()
+    start_date, end_date, window_note = _metric_set_window(
+        client, package_name, summary_metric_sets, days
+    )
 
     crash_rate = client.query_metric_set(
         package_name=package_name,
