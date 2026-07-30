@@ -3525,7 +3525,10 @@ def _latest_daily_end(client: PlayStoreClient, package_name: str, metric_set: st
             # hour is how far into that day the aggregation has run.
             if all(part in latest for part in ("year", "month", "day")):
                 result = date(latest["year"], latest["month"], latest["day"])
-            break
+                # Inside the `if` on purpose: a malformed first DAILY entry must
+                # not mask a well-formed later one. Breaking unconditionally
+                # settled for the first DAILY entry whatever shape it was in.
+                break
     except Exception as exc:  # noqa: BLE001 - freshness is advisory, never fatal
         ttl = _FRESHNESS_FAILURE_TTL_SECONDS
         logger.warning(

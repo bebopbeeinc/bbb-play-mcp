@@ -164,8 +164,13 @@ _REPORTING_DATE_FORMATS: tuple[tuple[str, bool], ...] = (
 )
 
 # Length of the window built when a caller supplies neither bound. The API
-# requires a start_date, so there is always a default to pick; this is the
-# number of daily points it asks for, inclusive of both ends.
+# requires a start_date, so there is always a default to pick.
+#
+# This is the number of daily points requested, and because endTime is EXCLUSIVE
+# it is also the span in days: start = end - 28 yields 28 points. Do not read it
+# as inclusive of both ends — an earlier version of this comment said that, and
+# it was the recorded justification for the -27 -> -28 change, which shifts every
+# default window by a day. See the note at the anchor calculation below.
 _REPORTING_DEFAULT_WINDOW_DAYS = 28
 
 
@@ -5992,7 +5997,12 @@ class PlayStoreClient:
             # disagreed with the server-side helper, which already subtracted the
             # full span. One semantics, stated once, used by both paths.
             start_date = (anchor - _dt.timedelta(days=_REPORTING_DEFAULT_WINDOW_DAYS)).isoformat()
-            if anchor_hour is not None:
+            # Carry the hour only where an hour is legal. Appending it under DAILY
+            # would synthesise an invalid start_date, and because the validation
+            # loop below checks startTime first, the resulting error would name
+            # `start_date` — a value the caller never supplied — instead of the
+            # `end_date` they actually passed.
+            if anchor_hour is not None and aggregation_period != "DAILY":
                 start_date = f"{start_date}T{anchor_hour:02d}"
 
         if aggregation_period:

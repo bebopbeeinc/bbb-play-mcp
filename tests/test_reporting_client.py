@@ -1025,3 +1025,28 @@ def test_query_metric_set_keeps_the_hour_when_deriving_an_hourly_start() -> None
     spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
     assert spec["endTime"] == {"year": 2026, "month": 6, "day": 1, "hours": 9}
     assert spec["startTime"] == {"year": 2026, "month": 5, "day": 4, "hours": 9}
+
+
+def test_daily_with_hourly_end_date_blames_the_caller_s_field() -> None:
+    """The DAILY-with-hour error must name end_date, not the synthesised start.
+
+    Regression: when only an hourly end_date is given, the default start is
+    derived from it. Carrying the hour onto that start made the validation loop
+    — which checks startTime first — raise against `start_date`, a value the
+    caller never supplied.
+    """
+    service = MagicMock()
+
+    with pytest.raises(PlayStoreClientError) as excinfo:
+        _client(service).query_metric_set(
+            package_name=PACKAGE,
+            metric_set="crashRateMetricSet",
+            metrics=["crashRate"],
+            end_date="2026-06-01T09",
+            aggregation_period="DAILY",
+        )
+
+    message = str(excinfo.value)
+    assert "end_date" in message
+    assert "start_date" not in message
+    assert "2026-06-01T09" in message
