@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import functools
+import hashlib
 import json
 import os
 import random
@@ -161,6 +162,16 @@ _REPORTING_DATE_FORMATS: tuple[tuple[str, bool], ...] = (
     ("%Y-%m-%dT%H", True),
     ("%Y-%m-%d", False),
 )
+
+# Length of the window built when a caller supplies neither bound. The API
+# requires a start_date, so there is always a default to pick.
+#
+# This is the number of daily points requested, and because endTime is EXCLUSIVE
+# it is also the span in days: start = end - 28 yields 28 points. Do not read it
+# as inclusive of both ends — an earlier version of this comment said that, and
+# it was the recorded justification for the -27 -> -28 change, which shifts every
+# default window by a day. See the note at the anchor calculation below.
+_REPORTING_DEFAULT_WINDOW_DAYS = 28
 
 
 class PlayStoreClientError(Exception):
@@ -322,6 +333,7 @@ class PlayStoreClient:
             if download_dir is not None
             else os.environ.get("PLAY_STORE_MCP_DOWNLOAD_DIR")
         )
+        self._credentials_fingerprint: str | None = None
         self._service: AndroidPublisherResource | None = None
         self._reporting_service: PlaydeveloperreportingResource | None = None
         # Serializes API I/O on this client's single (non-thread-safe) httplib2
@@ -5880,6 +5892,26 @@ class PlayStoreClient:
             return f"apps/{package_name}/{resource}"
         return f"apps/{package_name}"
 
+    @property
+    def credentials_fingerprint(self) -> str:
+        """Short, non-reversible id for the credentials this client authenticates with.
+
+        Anything cached per-account must be keyed on this rather than on the
+        package alone. Credentials arrive per request via the X-Google-Credentials
+        headers, so two callers can hit the same package with different service
+        accounts and different permissions -- and one account's failure must not
+        be served to another.
+
+        Hashed because this is a cache key, never a credential: the value is
+        derived from the secret but cannot reproduce it.
+        """
+        if self._credentials_fingerprint is None:
+            source = self._credentials_json or self._credentials_path or "application-default"
+            if not isinstance(source, str):
+                source = json.dumps(source, sort_keys=True)
+            self._credentials_fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+        return self._credentials_fingerprint
+
     @staticmethod
     def _reporting_datetime(value: str, field: str) -> dict[str, int]:
         """Parse a date bound into a google.type.DateTime dict.
@@ -5938,12 +5970,40 @@ class PlayStoreClient:
         # gets a trailing 28-day daily window rather than a guaranteed 400.
         aggregation_period = aggregation_period or "DAILY"
         if start_date is None:
-            # End one day back: the API rejects an end_date beyond the current
-            # data freshness ("should be at most the current freshness"), and
-            # today is always still aggregating.
-            end = _dt.date.today() - _dt.timedelta(days=1)
-            start_date = (end - _dt.timedelta(days=27)).isoformat()
-            end_date = end_date or end.isoformat()
+            if end_date is not None:
+                # Anchor the trailing window on the bound the caller actually
+                # gave. Deriving it from the clock instead produced start > end
+                # for any historical end_date -- an inverted range, and the API
+                # rejects it. Reuse the shared parser so an unparseable end_date
+                # fails here with the same message it would have failed with below.
+                parsed = cls._reporting_datetime(end_date, "end_date")
+                anchor = _dt.date(parsed["year"], parsed["month"], parsed["day"])
+                # Keep the hour for an HOURLY bound. Dropping it silently widened
+                # the window to 28 days plus that many hours, and those extra rows
+                # can displace requested ones once max_results is in play.
+                anchor_hour = parsed.get("hours")
+            else:
+                # Neither bound given. End one day back: the API rejects an
+                # end_date beyond the current data freshness ("should be at most
+                # the current freshness"), and today is always still aggregating.
+                # Callers that need the real ceiling should ask the metric set --
+                # freshness differs per metric set, so this is a safe floor, not
+                # a substitute for get_metric_set_freshness.
+                anchor = _dt.date.today() - _dt.timedelta(days=1)
+                end_date = anchor.isoformat()
+                anchor_hour = None
+            # endTime is exclusive, so N daily points span N days, not N-1. The
+            # old -27 yielded 27 points for a window documented as 28, and it
+            # disagreed with the server-side helper, which already subtracted the
+            # full span. One semantics, stated once, used by both paths.
+            start_date = (anchor - _dt.timedelta(days=_REPORTING_DEFAULT_WINDOW_DAYS)).isoformat()
+            # Carry the hour only where an hour is legal. Appending it under DAILY
+            # would synthesise an invalid start_date, and because the validation
+            # loop below checks startTime first, the resulting error would name
+            # `start_date` — a value the caller never supplied — instead of the
+            # `end_date` they actually passed.
+            if anchor_hour is not None and aggregation_period != "DAILY":
+                start_date = f"{start_date}T{anchor_hour:02d}"
 
         if aggregation_period:
             if aggregation_period not in _REPORTING_AGGREGATION_PERIODS:

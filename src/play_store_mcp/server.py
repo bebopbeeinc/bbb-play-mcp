@@ -13,9 +13,11 @@ import os
 import secrets
 import sys
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import uvicorn
@@ -25,6 +27,9 @@ from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 from play_store_mcp.client import (
     REPORTING_METRIC_SETS,
@@ -3420,10 +3425,191 @@ def _vitals_window(days: int) -> tuple[str, str]:
 
     The end bound is exclusive, so the window is the `days` complete days before
     today rather than a partial day of data that is still aggregating.
+
+    Only for the error-search and anomaly endpoints, which accept an end bound of
+    today. The metric-set `query` endpoint does NOT -- it enforces a per-metric-set
+    freshness ceiling and 400s above it -- so those callers must use
+    _metric_set_window instead. The two endpoints really do differ: measured live
+    on 2026-07-29, errorCountMetricSet was fresh to that same day 06:00 while
+    crashRate, anrRate, slowStart and excessiveWakeup all stopped at 2026-07-28.
     """
     end = datetime.now(UTC).date()
     start = end - timedelta(days=days)
     return start.isoformat(), end.isoformat()
+
+
+# Freshness moves at most hourly and every vitals tool needs it, so cache it
+# briefly rather than spending a quota call per query. get_vitals_summary alone
+# would otherwise cost three extra lookups.
+_FRESHNESS_TTL_SECONDS = 900
+
+# Hard ceiling on cache size. Expired entries are evicted on write, but a server
+# taking requests for many distinct packages faster than the TTL expires them
+# would still grow without one -- and package_name is caller-supplied, so the key
+# space is not ours to bound.
+_FRESHNESS_CACHE_MAX = 512
+
+# A lookup that threw tells us nothing durable -- a 429, a 5xx or a dropped
+# connection is not evidence that this metric set has no ceiling. Caching that
+# for the full TTL would pin an entire quarter hour of queries to the fallback
+# bound, and for a metric set lagging more than a day those queries keep 400ing
+# for the whole window. Remember the failure just long enough not to hammer.
+_FRESHNESS_FAILURE_TTL_SECONDS = 60
+
+# Keyed on (credentials fingerprint, package, metric set). The credential term is
+# load-bearing: per-request X-Google-Credentials headers mean two callers can ask
+# about the same package with different service accounts. Without it, an account
+# lacking the app-quality permission caches its failure as None and an authorized
+# account served that entry silently falls back to the clock -- reintroducing the
+# very 400 this module exists to avoid.
+#
+# Value is (stamp, ceiling, ttl): entries expire on their own schedule so a
+# transient failure does not get a successful lookup's lifetime.
+_freshness_cache: dict[tuple[str, str, str], tuple[float, date | None, float]] = {}
+
+# The tools are sync callables, so the HTTP transports run them in a worker
+# thread pool and several can touch this dict at once. Without the lock, pruning
+# iterates a dict another worker is inserting into -- "dictionary changed size
+# during iteration" -- and two workers can delete the same key. Held only around
+# the dict operations, never across the network call: serialising every freshness
+# lookup behind one lock would be worse than the duplicate fetch it prevents.
+_freshness_lock = Lock()
+
+
+def _prune_freshness_cache(now: float) -> None:
+    """Drop expired entries, then the oldest if still over the cap.
+
+    Caller must hold ``_freshness_lock``.
+    """
+    for key in [k for k, (stamp, _, ttl) in _freshness_cache.items() if now - stamp >= ttl]:
+        del _freshness_cache[key]
+    while len(_freshness_cache) >= _FRESHNESS_CACHE_MAX:
+        del _freshness_cache[min(_freshness_cache, key=lambda k: _freshness_cache[k][0])]
+
+
+def _latest_daily_end(client: PlayStoreClient, package_name: str, metric_set: str) -> date | None:
+    """The newest end bound this metric set's DAILY timeline will accept.
+
+    Takes the caller's client rather than resolving its own: with per-request
+    credentials every ``get_client_from_context()`` builds a fresh
+    ``PlayStoreClient``, and each one reloads credentials and refetches API
+    discovery. A cold summary asking for its own would construct four.
+
+    Returns None when freshness cannot be determined -- an unknown metric set, a
+    permission error, or a response with no DAILY entry (not every metric set
+    publishes one for every aggregation period). Callers fall back to the clock;
+    a missing ceiling must not turn a working query into an error.
+    """
+    key = (client.credentials_fingerprint, package_name, metric_set)
+    now = monotonic()
+    with _freshness_lock:
+        cached = _freshness_cache.get(key)
+        if cached is not None and now - cached[0] < cached[2]:
+            return cached[1]
+
+    result: date | None = None
+    # A well-formed response with no DAILY entry is a durable fact about this
+    # metric set; an exception is not. They get different lifetimes.
+    ttl = _FRESHNESS_TTL_SECONDS
+    try:
+        freshness = client.get_metric_set_freshness(
+            package_name=package_name, metric_set=metric_set
+        )
+        entries = freshness.get("freshnessInfo", {}).get("freshnesses", [])
+        for entry in entries:
+            if entry.get("aggregationPeriod") != VITALS_AGGREGATION_PERIOD:
+                continue
+            latest = entry.get("latestEndTime") or {}
+            # A DAILY latestEndTime may still carry an hours field (errorCount
+            # reports "day 29, hours 6"). The calendar date is the bound; the
+            # hour is how far into that day the aggregation has run.
+            if all(part in latest for part in ("year", "month", "day")):
+                result = date(latest["year"], latest["month"], latest["day"])
+                # Inside the `if` on purpose: a malformed first DAILY entry must
+                # not mask a well-formed later one. Breaking unconditionally
+                # settled for the first DAILY entry whatever shape it was in.
+                break
+    except Exception as exc:  # noqa: BLE001 - freshness is advisory, never fatal
+        ttl = _FRESHNESS_FAILURE_TTL_SECONDS
+        logger.warning(
+            "Could not read metric set freshness; falling back to the clock",
+            package_name=package_name,
+            metric_set=metric_set,
+            error=str(exc),
+        )
+
+    with _freshness_lock:
+        _prune_freshness_cache(now)
+        if result is None:
+            # Two workers can miss the same key and both fetch outside the lock.
+            # If one succeeded while this one failed, the success is the better
+            # answer and must not be overwritten by a failure that happened to
+            # finish last -- that would discard a just-fetched ceiling and pin
+            # the next 60s to the fallback bound.
+            existing = _freshness_cache.get(key)
+            if existing is not None and existing[1] is not None and now - existing[0] < existing[2]:
+                return existing[1]
+        _freshness_cache[key] = (now, result, ttl)
+    return result
+
+
+def _metric_set_window(
+    client: PlayStoreClient, package_name: str, metric_sets: Sequence[str], days: int
+) -> tuple[str, str, str | None]:
+    """Trailing window of `days` ending at the latest data ALL of `metric_sets` have.
+
+    The metric-set query endpoint rejects an end bound past a metric set's
+    freshness ("'timeline_spec.end_date' field should be at most the current
+    freshness"), so anchoring on the clock 400s on every call -- which is exactly
+    what it did until this was measured against the live API. Freshness is
+    per-metric-set, so a request spanning several takes the oldest ceiling: one
+    window the whole response can be compared across.
+
+    That guarantee only holds when EVERY ceiling was readable. If one lookup
+    fails, the minimum of the rest is not necessarily safe for the one that
+    failed -- it may lag further, and its query would still 400. In that case the
+    window is clamped to the strictest bound available and the note says which
+    metric sets were unverified, rather than claiming a guarantee that was not
+    established.
+
+    Returns (start_date, end_date, note) where note is set when the window had to
+    be pulled back from today, so the caller can say so rather than silently
+    answering a different question than the one asked.
+    """
+    ceilings: list[date] = []
+    unverified: list[str] = []
+    for metric_set in metric_sets:
+        ceiling = _latest_daily_end(client, package_name, metric_set)
+        if ceiling is None:
+            unverified.append(metric_set)
+        else:
+            ceilings.append(ceiling)
+
+    clock_end = datetime.now(UTC).date()
+    # One day back is the safe floor -- today is always still aggregating -- and
+    # it is what the client's own default uses.
+    floor = clock_end - timedelta(days=1)
+    # Anything unverified drags the bound down to the floor: it is the most
+    # conservative end we can justify without having read that metric set.
+    end = min([*ceilings, floor]) if unverified else min(ceilings) if ceilings else floor
+
+    note = None
+    if unverified:
+        note = (
+            f"Window ends {end.isoformat()}. Freshness could not be read for "
+            f"{', '.join(unverified)}, so this window is the most conservative bound "
+            "available rather than a verified one; that metric set may still lag "
+            "further. Call get_metric_freshness to check."
+        )
+    elif end < clock_end:
+        note = (
+            f"Window ends {end.isoformat()}, not today: that is the latest data "
+            f"{'these metric sets have' if len(metric_sets) > 1 else 'this metric set has'}. "
+            "Vitals lag real time by a day or more."
+        )
+
+    start = end - timedelta(days=days)
+    return start.isoformat(), end.isoformat(), note
 
 
 def _query_vitals(
@@ -3439,9 +3625,8 @@ def _query_vitals(
     query per dimension value, which matters because the API's default quota is
     around 10 QPS.
     """
-    start_date, end_date = _vitals_window(days)
-
     client = get_client_from_context()
+    start_date, end_date, window_note = _metric_set_window(client, package_name, [metric_set], days)
 
     data = client.query_metric_set(
         package_name=package_name,
@@ -3453,7 +3638,7 @@ def _query_vitals(
         aggregation_period=VITALS_AGGREGATION_PERIOD,
     )
 
-    return {
+    result = {
         "package_name": package_name,
         "metric_set": metric_set,
         "metrics": metrics,
@@ -3463,6 +3648,9 @@ def _query_vitals(
         "days": days,
         "data": data,
     }
+    if window_note:
+        result["window_note"] = window_note
+    return result
 
 
 @mcp.tool()
@@ -3481,15 +3669,19 @@ def get_crash_rate(
     1.09% bad-behavior threshold applies to), and distinctUsers, the denominator
     those rates are computed over. Rates are fractions: 0.0109 means 1.09%.
 
-    Costs a single Reporting API query. Vitals lag real time, so an empty tail
-    (or an empty result with a `note`) usually means the window ran past the
-    latest available data — get_metric_freshness("crashRateMetricSet") reports
-    how current the metric set is.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
+
+    Vitals lag real time, so an empty tail (or an empty result with a `note`)
+    usually means the window ran past the latest available data —
+    get_metric_freshness("crashRateMetricSet") reports how current it is.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["versionCode"], ["deviceModel"], ["apiLevel"], ["countryCode"]).
             Omit for an app-wide timeline.
@@ -3525,15 +3717,19 @@ def get_anr_rate(
     applies to), and distinctUsers, the denominator. Rates are fractions:
     0.0047 means 0.47%.
 
-    Costs a single Reporting API query. Vitals lag real time, so an empty tail
-    (or an empty result with a `note`) usually means the window ran past the
-    latest available data — get_metric_freshness("anrRateMetricSet") reports how
-    current the metric set is.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
+
+    Vitals lag real time, so an empty tail (or an empty result with a `note`)
+    usually means the window ran past the latest available data —
+    get_metric_freshness("anrRateMetricSet") reports how current it is.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["versionCode"], ["deviceModel"], ["apiLevel"], ["countryCode"]).
             Omit for an app-wide timeline.
@@ -3568,12 +3764,15 @@ def get_excessive_wakeup_rate(
     woke more than 10 times per hour — the Android vitals signal for alarm and
     JobScheduler abuse draining battery. distinctUsers is the denominator.
 
-    Costs a single Reporting API query.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["versionCode"], ["deviceModel"]). Omit for an app-wide timeline.
 
@@ -3608,12 +3807,15 @@ def get_slow_start_rate(
     Pass dimensions=["startType"] to split COLD/WARM/HOT within the same single
     query — cold start is usually the one worth acting on.
 
-    Costs a single Reporting API query.
+    Costs one Reporting API query, plus one freshness lookup when this metric
+    set's ceiling is not already cached (first call for a package, new
+    credentials, or after the 15-minute TTL) — so two requests cold, one warm.
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
         dimensions: Optional breakdown resolved inside the same single query
             (e.g. ["startType"], ["versionCode"], ["deviceModel"]). Omit for a
             single app-wide timeline across all start types.
@@ -3656,9 +3858,12 @@ def get_vitals_summary(
     All rates are fractions (0.0109 = 1.09%) over distinctUsers, which each
     timeline also reports.
 
-    Cost: exactly three Reporting API queries, one per metric set, with no
-    dimension breakdown. The API's default quota is around 10 QPS, so this
-    deliberately does not fan out per version, device, or country — call
+    Cost: three Reporting API queries, one per metric set, with no dimension
+    breakdown — plus one freshness lookup per metric set when their ceilings are
+    not already cached, so six requests cold and three warm. The cold cost is
+    paid once per package per 15-minute TTL. The API's default quota is around
+    10 QPS, so this deliberately does not fan out per version, device, or
+    country — call
     get_crash_rate, get_anr_rate, or get_slow_start_rate with an explicit
     `dimensions` list when a breakdown is actually needed. Excessive wakeups
     have their own tool (get_excessive_wakeup_rate) and are not queried here.
@@ -3669,8 +3874,9 @@ def get_vitals_summary(
 
     Args:
         package_name: App package name (e.g., com.example.myapp)
-        days: Length of the trailing window in days, ending today exclusive
-            (default: 28)
+        days: Length of the trailing window in days, ending at the latest data the
+            metric set has, which is typically a day or more behind
+            today (default: 28)
 
     Returns:
         The shared window plus crash_rate, anr_rate, and slow_start_rate timelines
@@ -3678,9 +3884,11 @@ def get_vitals_summary(
     if err := _validate_vitals_days(days):
         return {"error": err}
 
-    start_date, end_date = _vitals_window(days)
-
+    summary_metric_sets = ["crashRateMetricSet", "anrRateMetricSet", "slowStartRateMetricSet"]
     client = get_client_from_context()
+    start_date, end_date, window_note = _metric_set_window(
+        client, package_name, summary_metric_sets, days
+    )
 
     crash_rate = client.query_metric_set(
         package_name=package_name,
@@ -3707,16 +3915,19 @@ def get_vitals_summary(
         aggregation_period=VITALS_AGGREGATION_PERIOD,
     )
 
-    return {
+    summary = {
         "package_name": package_name,
         "start_date": start_date,
         "end_date": end_date,
         "days": days,
-        "metric_sets": ["crashRateMetricSet", "anrRateMetricSet", "slowStartRateMetricSet"],
+        "metric_sets": summary_metric_sets,
         "crash_rate": crash_rate,
         "anr_rate": anr_rate,
         "slow_start_rate": slow_start_rate,
     }
+    if window_note:
+        summary["window_note"] = window_note
+    return summary
 
 
 @mcp.tool()

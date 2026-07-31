@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 from play_store_mcp.client import (
+    _REPORTING_DEFAULT_WINDOW_DAYS,
     REPORTING_API_NAME,
     REPORTING_API_VERSION,
     REPORTING_METRIC_SETS,
@@ -236,6 +238,74 @@ def test_query_metric_set_always_sends_timeline_with_a_period() -> None:
 
     spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
     assert spec["aggregationPeriod"] == "DAILY"
+
+
+def _timeline_bounds(service: MagicMock) -> tuple[date, date]:
+    """The (start, end) the client actually put on the wire, as dates."""
+    spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
+    return (
+        date(**{k: v for k, v in spec["startTime"].items() if k != "hours"}),
+        date(**{k: v for k, v in spec["endTime"].items() if k != "hours"}),
+    )
+
+
+def test_query_metric_set_default_window_anchors_on_a_supplied_end_date() -> None:
+    """A caller who gives only end_date gets a window ending there.
+
+    Regression: the default start was derived from the clock even when the
+    caller supplied end_date, so any historical end_date produced start > end --
+    an inverted range the API rejects.
+    """
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+        end_date="2026-06-01",
+    )
+
+    start, end = _timeline_bounds(service)
+    assert end == date(2026, 6, 1)
+    assert start == date(2026, 5, 4)
+    assert start < end
+
+
+def test_query_metric_set_default_window_ends_a_day_back() -> None:
+    """With neither bound given, the window ends yesterday -- today is still
+    aggregating, and the API rejects an end past the current freshness."""
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+    )
+
+    start, end = _timeline_bounds(service)
+    assert end == date.today() - timedelta(days=1)
+    assert (end - start).days == _REPORTING_DEFAULT_WINDOW_DAYS
+    assert start < end
+
+
+@pytest.mark.parametrize("end_date", ["2026-06-01", "2026-06-01T09", "2020-01-01"])
+def test_query_metric_set_never_builds_an_inverted_range(end_date: str) -> None:
+    """No supplied end_date, however old, may produce start > end."""
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+        end_date=end_date,
+        aggregation_period="HOURLY" if "T" in end_date else "DAILY",
+    )
+
+    start, end = _timeline_bounds(service)
+    assert start < end
 
 
 def test_query_metric_set_rejects_hour_on_daily_aggregation() -> None:
@@ -933,3 +1003,50 @@ def test_error_search_rejects_a_bad_interval_bound() -> None:
 
     with pytest.raises(PlayStoreClientError, match="Invalid end_date"):
         _client(service).search_error_issues(PACKAGE, end_date="last tuesday")
+
+
+def test_query_metric_set_keeps_the_hour_when_deriving_an_hourly_start() -> None:
+    """An HOURLY end_date must not lose its hour to the default start.
+
+    Dropping it widened the window to 28 days plus that many hours, and the extra
+    rows can displace requested ones once max_results is in play.
+    """
+    service = MagicMock()
+    _crashrate(service).query.return_value.execute.return_value = {"rows": []}
+
+    _client(service).query_metric_set(
+        package_name=PACKAGE,
+        metric_set="crashRateMetricSet",
+        metrics=["crashRate"],
+        end_date="2026-06-01T09",
+        aggregation_period="HOURLY",
+    )
+
+    spec = _crashrate(service).query.call_args.kwargs["body"]["timelineSpec"]
+    assert spec["endTime"] == {"year": 2026, "month": 6, "day": 1, "hours": 9}
+    assert spec["startTime"] == {"year": 2026, "month": 5, "day": 4, "hours": 9}
+
+
+def test_daily_with_hourly_end_date_blames_the_caller_s_field() -> None:
+    """The DAILY-with-hour error must name end_date, not the synthesised start.
+
+    Regression: when only an hourly end_date is given, the default start is
+    derived from it. Carrying the hour onto that start made the validation loop
+    — which checks startTime first — raise against `start_date`, a value the
+    caller never supplied.
+    """
+    service = MagicMock()
+
+    with pytest.raises(PlayStoreClientError) as excinfo:
+        _client(service).query_metric_set(
+            package_name=PACKAGE,
+            metric_set="crashRateMetricSet",
+            metrics=["crashRate"],
+            end_date="2026-06-01T09",
+            aggregation_period="DAILY",
+        )
+
+    message = str(excinfo.value)
+    assert "end_date" in message
+    assert "start_date" not in message
+    assert "2026-06-01T09" in message

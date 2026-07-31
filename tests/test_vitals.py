@@ -558,10 +558,17 @@ def test_vitals_summary_makes_exactly_three_round_trips(
 ) -> None:
     """The quota property, pinned end to end rather than at the mock client.
 
-    The Reporting API allows roughly 10 QPS. Counting at the transport catches
-    a regression the call-count test cannot: a summary that still made three
-    ``query_metric_set`` calls but paged, probed freshness, or fanned out
-    underneath would show up here as more than three requests.
+    The Reporting API allows roughly 10 QPS. Counting at the transport catches a
+    regression the call-count test cannot: a summary that still made three
+    ``query_metric_set`` calls but paged or fanned out underneath would show up
+    here as more than three requests.
+
+    Freshness probing is the one addition this budget deliberately allows, and
+    only on a cold cache. It was previously counted as a regression -- but the
+    three round trips it was protecting were three *failures*: the clock-derived
+    end bound exceeded the metric sets' freshness ceiling and every query 400'd.
+    Six requests that answer beat three that cannot. The cache keeps the steady
+    state at three, so the extra cost is paid once per package per TTL.
     """
     service = MagicMock()
     vitals = service.vitals.return_value
@@ -571,12 +578,20 @@ def test_vitals_summary_makes_exactly_three_round_trips(
 
     from play_store_mcp import server
 
+    server._freshness_cache.clear()
     client = _reporting_client(service)
     monkeypatch.setattr(server, "get_client_from_context", lambda: client)
 
     result = get_vitals_summary(PACKAGE)
 
-    assert _round_trips(service) == 3
+    # Cold: one freshness lookup per metric set, then the three queries.
+    assert _round_trips(service) == 6
+
+    # Warm: freshness is cached, so the steady state is the original budget.
+    before = _round_trips(service)
+    get_vitals_summary(PACKAGE)
+    assert _round_trips(service) - before == 3
+    server._freshness_cache.clear()
     assert result["crash_rate"]["rows"] == [{"c": 1}]
     assert result["anr_rate"]["rows"] == [{"a": 1}]
     assert result["slow_start_rate"]["rows"] == [{"s": 1}]
@@ -596,7 +611,12 @@ def test_vitals_summary_makes_exactly_three_round_trips(
 
 
 def test_single_metric_tools_make_one_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A dimension breakdown is one query with dimensions, not a query per value."""
+    """A dimension breakdown is one query with dimensions, not a query per value.
+
+    Cold, that is one freshness lookup plus the query; warm, the query alone. The
+    property being pinned is that dimensions do not fan out -- three dimensions
+    still cost one query, not one per dimension value.
+    """
     service = MagicMock()
     service.vitals.return_value.crashrate.return_value.query.return_value.execute.return_value = {
         "rows": [{"c": 1}]
@@ -604,10 +624,454 @@ def test_single_metric_tools_make_one_round_trip(monkeypatch: pytest.MonkeyPatch
 
     from play_store_mcp import server
 
+    server._freshness_cache.clear()
     monkeypatch.setattr(server, "get_client_from_context", lambda: _reporting_client(service))
 
     get_crash_rate(PACKAGE, dimensions=["versionCode", "deviceModel", "countryCode"])
 
-    assert _round_trips(service) == 1
+    assert _round_trips(service) == 2
+
+    before = _round_trips(service)
+    get_crash_rate(PACKAGE, dimensions=["versionCode", "deviceModel", "countryCode"])
+    assert _round_trips(service) - before == 1
+
+    server._freshness_cache.clear()
     body = service.vitals.return_value.crashrate.return_value.query.call_args.kwargs["body"]
     assert body["dimensions"] == ["versionCode", "deviceModel", "countryCode"]
+
+
+# =========================================================================
+# Freshness-derived windows
+# =========================================================================
+
+
+def _freshness(latest: date, aggregation_period: str = "DAILY") -> dict[str, Any]:
+    """A freshnessInfo payload shaped like the live API's."""
+    return {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": aggregation_period,
+                    "latestEndTime": {
+                        "year": latest.year,
+                        "month": latest.month,
+                        "day": latest.day,
+                        "timeZone": {"id": "America/Los_Angeles"},
+                    },
+                }
+            ]
+        }
+    }
+
+
+class TestFreshnessDerivedWindow:
+    """The metric-set query endpoint 400s on an end bound past a metric set's
+    freshness, so the window is derived from the data rather than the clock.
+
+    Measured live on 2026-07-29: crashRate/anrRate/slowStart/excessiveWakeup were
+    fresh only to 07-28 while errorCount reached 07-29, so a single clock-derived
+    end bound cannot be right for all of them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        from play_store_mcp import server
+
+        server._freshness_cache.clear()
+        yield
+        server._freshness_cache.clear()
+
+    def test_window_ends_at_the_metric_sets_freshness(self, mock_client: MagicMock) -> None:
+        ceiling = datetime.now(UTC).date() - timedelta(days=3)
+        mock_client.get_metric_set_freshness.return_value = _freshness(ceiling)
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_crash_rate(PACKAGE, days=7)
+
+        assert result["end_date"] == ceiling.isoformat()
+        assert result["start_date"] == (ceiling - timedelta(days=7)).isoformat()
+        assert "window_note" in result
+        kwargs = mock_client.query_metric_set.call_args.kwargs
+        assert kwargs["end_date"] == ceiling.isoformat()
+
+    def test_no_note_when_data_is_current(self, mock_client: MagicMock) -> None:
+        """A window that already reaches today needs no explanation."""
+        mock_client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        assert "window_note" not in get_crash_rate(PACKAGE, days=7)
+
+    def test_summary_takes_the_oldest_ceiling_of_its_metric_sets(
+        self, mock_client: MagicMock
+    ) -> None:
+        """One shared window across three metric sets must clear the strictest
+        ceiling, or the whole call 400s on whichever set is furthest behind."""
+        today = datetime.now(UTC).date()
+        ceilings = {
+            "crashRateMetricSet": today - timedelta(days=1),
+            "anrRateMetricSet": today - timedelta(days=4),
+            "slowStartRateMetricSet": today - timedelta(days=2),
+        }
+        mock_client.get_metric_set_freshness.side_effect = lambda metric_set, **_: _freshness(
+            ceilings[metric_set]
+        )
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_vitals_summary(PACKAGE, days=7)
+
+        assert result["end_date"] == (today - timedelta(days=4)).isoformat()
+        ends = {c.kwargs["end_date"] for c in mock_client.query_metric_set.call_args_list}
+        assert ends == {result["end_date"]}
+
+    def test_falls_back_to_a_day_back_when_freshness_errors(self, mock_client: MagicMock) -> None:
+        """A freshness lookup that fails must not turn a working query into an error."""
+        mock_client.get_metric_set_freshness.side_effect = PlayStoreClientError("no permission")
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_crash_rate(PACKAGE, days=7)
+
+        assert result["end_date"] == (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+        assert "window_note" in result
+
+    def test_falls_back_when_no_daily_entry_is_published(self, mock_client: MagicMock) -> None:
+        """Not every metric set reports every aggregation period."""
+        mock_client.get_metric_set_freshness.return_value = _freshness(
+            datetime.now(UTC).date(), aggregation_period="HOURLY"
+        )
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_crash_rate(PACKAGE, days=7)
+
+        assert result["end_date"] == (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+
+    def test_freshness_is_cached_across_calls(self, mock_client: MagicMock) -> None:
+        """Freshness moves at most hourly; paying a quota call per query is waste."""
+        mock_client.get_metric_set_freshness.return_value = _freshness(
+            datetime.now(UTC).date() - timedelta(days=1)
+        )
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        get_crash_rate(PACKAGE, days=7)
+        get_crash_rate(PACKAGE, days=14)
+
+        assert mock_client.get_metric_set_freshness.call_count == 1
+
+
+# Verbatim freshnessInfo payloads recorded from the live Play Developer Reporting
+# API on 2026-07-29. Kept as fixtures because the shape carries three traps that
+# a hand-written mock would not reproduce: HOURLY can precede DAILY, a DAILY
+# entry may itself carry an `hours` field, and some metric sets publish no HOURLY
+# entry at all.
+LIVE_FRESHNESS: dict[str, dict[str, Any]] = {
+    "crashRateMetricSet": {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": "HOURLY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 11},
+                },
+                {
+                    "aggregationPeriod": "DAILY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 28},
+                },
+            ]
+        }
+    },
+    "slowStartRateMetricSet": {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": "DAILY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 28},
+                }
+            ]
+        }
+    },
+    "errorCountMetricSet": {
+        "freshnessInfo": {
+            "freshnesses": [
+                {
+                    "aggregationPeriod": "HOURLY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 13},
+                },
+                {
+                    "aggregationPeriod": "DAILY",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 6},
+                },
+                {
+                    "aggregationPeriod": "FULL_RANGE",
+                    "latestEndTime": {"year": 2026, "month": 7, "day": 29, "hours": 6},
+                },
+            ]
+        }
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("metric_set", "expected"),
+    [
+        ("crashRateMetricSet", date(2026, 7, 28)),
+        ("slowStartRateMetricSet", date(2026, 7, 28)),
+        # Fresher than the rate metric sets, and its DAILY entry carries an hour.
+        # The calendar date is the bound; the hour is how far into it aggregation ran.
+        ("errorCountMetricSet", date(2026, 7, 29)),
+    ],
+)
+def test_live_freshness_payloads_yield_the_ceiling_the_api_enforces(
+    mock_client: MagicMock, metric_set: str, expected: date
+) -> None:
+    """Recorded responses must produce the same bound the API named in its 400:
+    "'timeline_spec.end_date' field should be at most the current freshness
+    2026-07-28 00:00". Anchoring on the clock instead 400s on every call."""
+    from play_store_mcp import server
+
+    server._freshness_cache.clear()
+    mock_client.credentials_fingerprint = "acct"
+    mock_client.get_metric_set_freshness.return_value = LIVE_FRESHNESS[metric_set]
+
+    assert server._latest_daily_end(mock_client, PACKAGE, metric_set) == expected
+
+    server._freshness_cache.clear()
+
+
+class TestFreshnessCacheHygiene:
+    """Properties of the cache itself, all three raised in review."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        from play_store_mcp import server
+
+        server._freshness_cache.clear()
+        yield
+        server._freshness_cache.clear()
+
+    def test_cache_is_scoped_to_the_credentials(self) -> None:
+        """Credentials arrive per request, so one account's failure must not be
+        served to another. Without the credential term in the key, an account
+        without the app-quality permission caches None and an authorized account
+        silently inherits the fallback -- and the 400 this module exists to avoid."""
+        from play_store_mcp import server
+
+        denied = MagicMock()
+        denied.credentials_fingerprint = "acct-denied"
+        denied.get_metric_set_freshness.side_effect = PlayStoreClientError("no permission")
+
+        allowed = MagicMock()
+        allowed.credentials_fingerprint = "acct-allowed"
+        ceiling = datetime.now(UTC).date() - timedelta(days=3)
+        allowed.get_metric_set_freshness.return_value = _freshness(ceiling)
+
+        assert server._latest_daily_end(denied, PACKAGE, "crashRateMetricSet") is None
+        assert server._latest_daily_end(allowed, PACKAGE, "crashRateMetricSet") == ceiling
+        allowed.get_metric_set_freshness.assert_called_once()
+
+    def test_expired_entries_are_evicted_not_merely_ignored(self) -> None:
+        """A TTL checked only on read leaves every key resident forever, and
+        package_name is caller-supplied."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
+
+        server._latest_daily_end(client, "com.old.app", "crashRateMetricSet")
+        assert len(server._freshness_cache) == 1
+
+        # Age the existing entry past the TTL, then touch a different key.
+        stale_key = next(iter(server._freshness_cache))
+        stamp, value, ttl = server._freshness_cache[stale_key]
+        server._freshness_cache[stale_key] = (stamp - ttl - 1, value, ttl)
+
+        server._latest_daily_end(client, "com.new.app", "crashRateMetricSet")
+
+        assert stale_key not in server._freshness_cache
+        assert len(server._freshness_cache) == 1
+
+    def test_cache_is_capped(self) -> None:
+        """Distinct packages arriving faster than the TTL still cannot grow forever."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(datetime.now(UTC).date())
+
+        for i in range(server._FRESHNESS_CACHE_MAX + 25):
+            server._latest_daily_end(client, f"com.example.app{i}", "crashRateMetricSet")
+
+        assert len(server._freshness_cache) <= server._FRESHNESS_CACHE_MAX
+
+    def test_summary_does_not_claim_a_window_it_could_not_verify(
+        self, mock_client: MagicMock
+    ) -> None:
+        """If one of the three ceilings is unreadable, the minimum of the other
+        two is not known to be safe for it -- it may lag further. Clamp to the
+        conservative floor and say the window is unverified."""
+
+        today = datetime.now(UTC).date()
+        # Both readable ceilings are NEWER than the conservative floor, so
+        # min(known) and min(known + floor) differ. Anything less and this test
+        # passes against the bug it exists to catch.
+        known = {
+            "crashRateMetricSet": today,
+            "anrRateMetricSet": today,
+        }
+
+        def _freshness_or_fail(metric_set: str, **_: Any) -> dict[str, Any]:
+            if metric_set not in known:
+                raise PlayStoreClientError("no permission")
+            return _freshness(known[metric_set])
+
+        mock_client.credentials_fingerprint = "acct"
+        mock_client.get_metric_set_freshness.side_effect = _freshness_or_fail
+        mock_client.query_metric_set.return_value = {"rows": []}
+
+        result = get_vitals_summary(PACKAGE, days=7)
+
+        assert result["end_date"] == (today - timedelta(days=1)).isoformat()
+        assert "slowStartRateMetricSet" in result["window_note"]
+        assert "unverified" in result["window_note"] or "conservative" in result["window_note"]
+
+
+class TestFreshnessClientAndConcurrency:
+    """The second review round: client reuse, transient failures, and races."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> Any:
+        from play_store_mcp import server
+
+        server._freshness_cache.clear()
+        yield
+        server._freshness_cache.clear()
+
+    def _client(self, ceiling: date | None = None) -> MagicMock:
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(
+            ceiling or datetime.now(UTC).date()
+        )
+        client.query_metric_set.return_value = {"rows": []}
+        return client
+
+    def test_one_client_serves_freshness_and_queries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With per-request credentials each resolve builds a PlayStoreClient that
+        reloads credentials and refetches discovery, so a cold summary asking for
+        its own would construct four."""
+        from play_store_mcp import server
+
+        client = self._client()
+        calls = {"n": 0}
+
+        def _resolve() -> MagicMock:
+            calls["n"] += 1
+            return client
+
+        monkeypatch.setattr(server, "get_client_from_context", _resolve)
+
+        get_vitals_summary(PACKAGE, days=7)
+        assert calls["n"] == 1
+
+        calls["n"] = 0
+        get_crash_rate(PACKAGE, days=7)
+        assert calls["n"] == 1
+
+    def test_transient_failures_get_a_short_lifetime(self) -> None:
+        """A 429 or a dropped connection is not evidence that this metric set has
+        no ceiling. Caching it for the full TTL pins a quarter hour of queries to
+        the fallback bound -- and keeps 400ing anything lagging further."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.side_effect = PlayStoreClientError("429 rate limited")
+
+        assert server._latest_daily_end(client, PACKAGE, "crashRateMetricSet") is None
+
+        (_, value, ttl) = next(iter(server._freshness_cache.values()))
+        assert value is None
+        assert ttl == server._FRESHNESS_FAILURE_TTL_SECONDS
+        assert ttl < server._FRESHNESS_TTL_SECONDS
+
+    def test_a_valid_response_without_a_daily_entry_keeps_the_full_lifetime(self) -> None:
+        """That one is a durable fact about the metric set, not a transient error."""
+        from play_store_mcp import server
+
+        client = MagicMock()
+        client.credentials_fingerprint = "acct"
+        client.get_metric_set_freshness.return_value = _freshness(
+            datetime.now(UTC).date(), aggregation_period="HOURLY"
+        )
+
+        assert server._latest_daily_end(client, PACKAGE, "crashRateMetricSet") is None
+
+        (_, value, ttl) = next(iter(server._freshness_cache.values()))
+        assert value is None
+        assert ttl == server._FRESHNESS_TTL_SECONDS
+
+    def test_concurrent_lookups_do_not_corrupt_the_cache(self) -> None:
+        """The tools are sync callables, so HTTP transports run them in a worker
+        pool. Unsynchronised, pruning iterates a dict another worker is inserting
+        into: "dictionary changed size during iteration"."""
+        import threading
+
+        from play_store_mcp import server
+
+        client = self._client()
+        errors: list[BaseException] = []
+        start = threading.Barrier(8)
+
+        def hammer(worker: int) -> None:
+            try:
+                start.wait()
+                for i in range(150):
+                    server._latest_daily_end(
+                        client, f"com.example.w{worker}.app{i}", "crashRateMetricSet"
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(w,)) for w in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors, f"{type(errors[0]).__name__}: {errors[0]}"
+        assert len(server._freshness_cache) <= server._FRESHNESS_CACHE_MAX
+
+
+def test_a_failed_lookup_never_overwrites_a_concurrent_success() -> None:
+    """Two workers can miss the same key and both fetch outside the lock. If one
+    succeeds and the other fails, the failure must not win by finishing last --
+    that discards a just-fetched ceiling and pins the next 60s to the fallback.
+
+    The interleaving is forced rather than hoped for: the losing lookup completes
+    the winning one from inside its own network call, then raises. Calling them
+    in sequence would not exercise this at all -- the second would simply read
+    the warm cache and never reach the write path.
+    """
+    from play_store_mcp import server
+
+    server._freshness_cache.clear()
+    ceiling = datetime.now(UTC).date() - timedelta(days=3)
+
+    winner = MagicMock()
+    winner.credentials_fingerprint = "acct"
+    winner.get_metric_set_freshness.return_value = _freshness(ceiling)
+
+    loser = MagicMock()
+    loser.credentials_fingerprint = "acct"
+
+    def _winner_lands_then_fail(**_: Any) -> dict[str, Any]:
+        server._latest_daily_end(winner, PACKAGE, "crashRateMetricSet")
+        raise PlayStoreClientError("429 rate limited")
+
+    loser.get_metric_set_freshness.side_effect = _winner_lands_then_fail
+
+    # The loser misses the cache, and the winner's success lands mid-flight.
+    assert server._latest_daily_end(loser, PACKAGE, "crashRateMetricSet") == ceiling
+
+    (_, value, ttl) = next(iter(server._freshness_cache.values()))
+    assert value == ceiling
+    assert ttl == server._FRESHNESS_TTL_SECONDS
+    server._freshness_cache.clear()
