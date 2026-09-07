@@ -37,7 +37,7 @@ _REVIEW_RESPONSE = {
                 "text": "Nice app",
                 "reviewerLanguage": "en",
                 "device": "Pixel",
-                "androidOsVersion": "13",
+                "androidOsVersion": 13,
                 "appVersionCode": 100,
                 "appVersionName": "1.0.0",
                 "lastModified": {"seconds": "1767225600", "nanos": 0},

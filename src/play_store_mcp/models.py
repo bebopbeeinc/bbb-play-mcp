@@ -63,7 +63,9 @@ class Review(BaseModel):
     comment: str = Field(..., description="Review comment")
     language: str = Field(..., description="Review language")
     device: str | None = Field(None, description="Device name")
-    android_version: str | None = Field(None, description="Android OS version")
+    android_version: int | None = Field(
+        None, description="Android SDK version of the reviewer's device (e.g. 36 for Android 16)"
+    )
     app_version_code: int | None = Field(None, description="App version code")
     app_version_name: str | None = Field(None, description="App version name")
     last_modified: datetime | None = Field(None, description="Last modification time")
