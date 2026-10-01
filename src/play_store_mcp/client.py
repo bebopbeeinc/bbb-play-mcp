@@ -206,6 +206,26 @@ def _parse_rfc3339(value: str | None) -> datetime | None:
         return None
 
 
+# Android release for each SDK level, so a review can say "Android 12" where the
+# API says only androidOsVersion 31. A table rather than a formula because the
+# numbering has no rule to compute: 27 is 8.1 and 32 is 12L. A level outside it
+# (pre-Oreo, or newer than this table) gives None, never a guess; the raw level
+# is still on android_version either way.
+_ANDROID_RELEASE_BY_SDK: dict[int, str] = {
+    26: "8.0",
+    27: "8.1",
+    28: "9",
+    29: "10",
+    30: "11",
+    31: "12",
+    32: "12L",
+    33: "13",
+    34: "14",
+    35: "15",
+    36: "16",
+}
+
+
 def _parse_review(review_data: dict[str, Any]) -> Review | None:
     """Parse a Reviews API resource into a Review, or None if it has no user comment."""
     user_comment = None
@@ -219,6 +239,11 @@ def _parse_review(review_data: dict[str, Any]) -> Review | None:
     if not user_comment:
         return None
 
+    # `device` is Play's internal code (e.g. "gta4lvewifi"), which a person
+    # filing a bug cannot read; deviceMetadata carries the maker and product name.
+    meta = user_comment.get("deviceMetadata") or {}
+    sdk = user_comment.get("androidOsVersion")
+
     return Review(
         review_id=review_data.get("reviewId", ""),
         author_name=review_data.get("authorName", "Anonymous"),
@@ -226,7 +251,10 @@ def _parse_review(review_data: dict[str, Any]) -> Review | None:
         comment=user_comment.get("text", ""),
         language=user_comment.get("reviewerLanguage", "en"),
         device=user_comment.get("device"),
-        android_version=user_comment.get("androidOsVersion"),
+        device_manufacturer=meta.get("manufacturer"),
+        device_product_name=meta.get("productName"),
+        android_version=sdk,
+        android_release=_ANDROID_RELEASE_BY_SDK.get(sdk),
         app_version_code=user_comment.get("appVersionCode"),
         app_version_name=user_comment.get("appVersionName"),
         last_modified=_parse_timestamp(user_comment.get("lastModified")),

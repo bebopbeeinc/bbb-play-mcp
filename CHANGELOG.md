@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested alongside `androidpublisher`, and the Reporting API is built as a
   **separate** discovery service, lazily — a deployment that never asks for
   vitals never pays for the extra discovery fetch.
+- Reviews carry `device_manufacturer`, `device_product_name` (from the review's
+  `deviceMetadata`) and `android_release` ("12" for SDK 31), so a bug filed from
+  a review can name the device instead of Play's internal device code.
 
 ### Requirements
 - Vitals need **two separate gates**, and neither implies the other: the

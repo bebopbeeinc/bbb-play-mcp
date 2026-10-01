@@ -62,9 +62,18 @@ class Review(BaseModel):
     star_rating: int = Field(..., description="Star rating (1-5)")
     comment: str = Field(..., description="Review comment")
     language: str = Field(..., description="Review language")
-    device: str | None = Field(None, description="Device name")
+    device: str | None = Field(None, description="Play's device code (e.g. gta4lvewifi)")
+    device_manufacturer: str | None = Field(
+        None, description="Maker of the reviewer's device, from deviceMetadata"
+    )
+    device_product_name: str | None = Field(
+        None, description="Product name of the reviewer's device, from deviceMetadata"
+    )
     android_version: int | None = Field(
         None, description="Android SDK version of the reviewer's device (e.g. 36 for Android 16)"
+    )
+    android_release: str | None = Field(
+        None, description="Android release for android_version (e.g. '12' for 31); None if unmapped"
     )
     app_version_code: int | None = Field(None, description="App version code")
     app_version_name: str | None = Field(None, description="App version name")

@@ -19,8 +19,10 @@ Each review includes:
 - `star_rating` — Rating from 1 to 5
 - `comment` — Review text
 - `language` — Original language
-- `device` — Device name
-- `android_version` — Android OS version
+- `device` — Play's device code (e.g. `gta4lvewifi`)
+- `device_manufacturer` / `device_product_name` — The device's maker and product name, from the review's `deviceMetadata`
+- `android_version` — Android SDK level (e.g. `31`)
+- `android_release` — That level's Android release (e.g. `"12"`), or `null` for a level outside 26–36
 - `app_version_code` / `app_version_name` — App version
 - `last_modified` — Timestamp
 - `developer_reply` — Existing reply (if any)

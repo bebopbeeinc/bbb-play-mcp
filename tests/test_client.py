@@ -264,6 +264,48 @@ class TestReviews:
         assert reviews[0].comment == "Great app!"
         assert reviews[1].developer_reply == "Thanks for the feedback!"
 
+    def test_get_reviews_reads_device_metadata(
+        self,
+        client: PlayStoreClient,
+        _mock_service: MagicMock,
+    ) -> None:
+        """The maker, product name and Android release come from the review itself."""
+        _mock_service.reviews.return_value.list.return_value.execute.return_value = {
+            "reviews": [
+                {
+                    "reviewId": "with-metadata",
+                    "comments": [
+                        {
+                            "userComment": {
+                                "text": "it won't load",
+                                "device": "sholes",
+                                "androidOsVersion": 31,
+                                "deviceMetadata": {
+                                    "manufacturer": "Motorola",
+                                    "productName": "Droid",
+                                },
+                            }
+                        }
+                    ],
+                },
+                {
+                    "reviewId": "unmapped-sdk",
+                    "comments": [{"userComment": {"text": "ok", "androidOsVersion": 25}}],
+                },
+            ]
+        }
+
+        known, unmapped = client.get_reviews("com.example.app")
+
+        assert known.device == "sholes"
+        assert known.device_manufacturer == "Motorola"
+        assert known.device_product_name == "Droid"
+        assert (known.android_version, known.android_release) == (31, "12")
+        # No metadata and an SDK level the table does not cover: None, not a guess.
+        assert unmapped.device_manufacturer is None
+        assert unmapped.device_product_name is None
+        assert (unmapped.android_version, unmapped.android_release) == (25, None)
+
     def test_reply_to_review_success(
         self,
         client: PlayStoreClient,
